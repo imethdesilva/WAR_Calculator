@@ -6,7 +6,6 @@ from dateutil.relativedelta import relativedelta
 import os
 import io
 
-# --- CORE SELECTIONS ENGINE ---
 class SelectionsEngine:
     def __init__(self):
         self.quad_ranges = []
@@ -100,7 +99,7 @@ class SelectionsEngine:
             "players": players_found
         }
 
-# --- UI CONFIGURATION ---
+# UI
 st.set_page_config(page_title="National Selections Dashboard", layout="wide")
 
 st.markdown("""
@@ -154,7 +153,6 @@ if 'engine' not in st.session_state:
     st.session_state.processed_files = False
     st.session_state.sorted_leaderboard_names = []
 
-# --- SIDEBAR ---
 with st.sidebar:
     st.title("Administrative Panel")
     selected_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"])
@@ -217,13 +215,13 @@ with st.sidebar:
                 st.session_state.processed_files = True
                 st.rerun()
 
-# --- MAIN DASHBOARD ---
+# Main
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
 tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria"])
 
-# TAB 1: OVERVIEW
+# Overview
 with tabs[0]:
     if 'config' in st.session_state:
         c1, c2, c3, c4 = st.columns(4)
@@ -240,7 +238,7 @@ with tabs[0]:
     else:
         st.info("Awaiting Configuration. Please initialize the selection window in the sidebar.")
 
-# TAB 2: LEADERBOARD
+# Leaderboard
 with tabs[1]:
     if st.session_state.processed_files:
         rows = []
@@ -284,15 +282,14 @@ with tabs[1]:
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
-# TAB 3: AUDIT
+# Player Breakdown
 with tabs[2]:
     if st.session_state.processed_files:
         player_select = st.selectbox("Search Player for Audit", sorted(st.session_state.players_db.keys()))
         if player_select:
             p_data = st.session_state.players_db[player_select]
             st.subheader(f"Participation History: {player_select}")
-            
-            # Sort by Latest Date First for Display
+
             p_df = pd.DataFrame(p_data["history"])
             p_df['Date_dt'] = pd.to_datetime(p_df['Date'])
             p_df = p_df.sort_values(by="Date_dt", ascending=False).drop(columns=['Date_dt'])
@@ -312,7 +309,6 @@ with tabs[2]:
                 "Value": [len(p_data['quads']), f"{total_w:.2f}", f"{total_wv:,.2f}", p_data['total_games'], calc_war]
             })
 
-            # Force values to strings to prevent the Arrow conversion error
             summary_df['Value'] = summary_df['Value'].astype(str)
 
             st.markdown('<div class="summary-container">', unsafe_allow_html=True)
@@ -331,25 +327,21 @@ with tabs[2]:
             )
             
             st.markdown("---")
-            # Master Export with Summary Rows
+            # Master Export
             if st.button("Generate Master WAR Breakdown"):
                 master_buffer = io.StringIO()
                 for name in st.session_state.sorted_leaderboard_names:
                     data = st.session_state.players_db[name]
                     master_buffer.write(f"Player Name: {name}\n")
-                    
-                    # Chronological history for CSV
+
                     h_df = pd.DataFrame(data["history"])
                     h_df.to_csv(master_buffer, index=False)
-                    
-                    # Calculation of Summary Line
+
                     m_w = sum(h['Weight'] for h in data['history'])
                     m_wv = sum(h['WeightedVal'] for h in data['history'])
                     m_g = data['total_games']
                     m_war = round(m_wv / m_w) if m_w > 0 else 0
                     
-                    # Write Summary Row matching the column structure
-                    # Aligning values under relevant columns (Weight, WeightedVal, Games, WAR)
                     master_buffer.write(f"SUMMARY,,,Total Weight,Total Weighted Val,Total Games,Calculated WAR\n")
                     master_buffer.write(f",,,{m_w:.2f},{m_wv:.2f},{m_g},{m_war}\n")
                     
@@ -364,7 +356,7 @@ with tabs[2]:
     else:
         st.info("Awaiting data processing.")
 
-# TAB 4: POLICY
+# Info
 with tabs[3]:
     st.header("National Selection Policy Summary")
     
