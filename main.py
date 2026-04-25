@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
+import io
 
 # --- CORE SELECTIONS ENGINE ---
 class SelectionsEngine:
@@ -13,9 +14,7 @@ class SelectionsEngine:
 
     def calculate_configuration(self, mode, intl_date_str):
         try:
-            # Parse target date and set selection parameters
             intl_date = datetime.strptime(intl_date_str, "%d.%m.%Y")
-            # WSC has a 6-month buffer; WYSC/others have 3 months
             offset = 6 if mode == "WSC" else 3
             cutoff_date = intl_date - relativedelta(months=offset)
             
@@ -30,12 +29,10 @@ class SelectionsEngine:
                 "min_war": 800
             }
 
-            # Generate 5 Quadrimesters (4-month blocks) ending at cutoff
             quads = []
             curr_end = cutoff_date
             for i in range(5, 0, -1):
                 start = curr_end - relativedelta(months=4)
-                # Weights: 1.0, 1.25, 1.5, 1.75, 2.0
                 weight = 1.0 + (i-1)*0.25
                 quads.append({"quad": i, "start": start, "end": curr_end, "weight": weight})
                 curr_end = start
@@ -49,7 +46,6 @@ class SelectionsEngine:
         lines = content.splitlines()
         t_date, t_name = None, "Unknown Tournament"
         
-        # Capture Date (DD.MM.YYYY) and Name from the first line
         for line in lines[:2]:
             date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', line)
             if date_match:
@@ -67,29 +63,23 @@ class SelectionsEngine:
             line = line.strip()
             if not line: continue
 
-            # Track game count sections (e.g., "18 games")
             game_header = re.search(r'^(\d+)\s+games', line.lower())
             if game_header:
                 current_section_games = int(game_header.group(1))
                 continue
 
-            # Identify Player Rows
             if re.match(r'^\d+\s+', line):
                 numeric_blocks = re.findall(r'\(?\s*[\d\-+]+\s*\)?', line)
                 if len(numeric_blocks) < 2: continue 
                 
                 try:
-                    # New Rating is the final numeric block
                     new_rating = int(numeric_blocks[-1].replace('(', '').replace(')', '').strip())
-
-                    # Old Rating
                     old_rating = 0
                     if len(numeric_blocks) >= 3:
                         try:
                             old_rating = int(numeric_blocks[-3].replace('(', '').replace(')', '').strip())
                         except: pass
 
-                    # Name Extraction Logic
                     name_part = re.sub(r'^\s*\d+\s+[\d\-+]+\s+[\d\-+*&]+\s+', '', raw_line)
                     name_part = re.sub(r'[\d\-+*&\(\)\s]+$', '', name_part).strip()
                     name_part = name_part.lstrip('*') 
@@ -113,10 +103,9 @@ class SelectionsEngine:
 # --- UI CONFIGURATION ---
 st.set_page_config(page_title="National Selections Dashboard", layout="wide")
 
-# Theme-aware CSS (Ensures visibility in both Light and Dark modes)
 st.markdown("""
     <style>
-    /* Metric Card Styling */
+    /* 1. Metric Card Styling: Professional contrast for Dark and Light modes */
     div[data-testid="stMetric"] {
         background-color: var(--secondary-background-color);
         border: 1px solid var(--border-color);
@@ -124,31 +113,38 @@ st.markdown("""
         border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
-    
-    /* Dynamic Text Colors based on Streamlit Theme */
-    div[data-testid="stMetricValue"] > div {
-        color: var(--text-color) !important;
-        font-weight: 700;
-    }
+    div[data-testid="stMetricValue"] > div { color: var(--text-color) !important; font-weight: 700; }
+    div[data-testid="stMetricLabel"] > div { color: var(--text-color); opacity: 0.8; font-weight: 600; }
 
-    div[data-testid="stMetricLabel"] > div {
-        color: var(--text-color);
-        opacity: 0.8;
-        font-weight: 600;
+    /* 2. Professional Buttons and Tabs */
+    div.stButton > button:first-child { 
+        background-color: #004a99; 
+        color: white; 
+        border-radius: 5px; 
+        width: 100%; 
+        font-weight: bold; 
+        border: none; 
     }
-
-    /* Button Styling */
-    div.stButton > button:first-child {
-        background-color: #004a99;
-        color: white;
-        border-radius: 5px;
-        width: 100%;
-        font-weight: bold;
-        border: none;
-    }
-    
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { font-weight: 600; }
+
+    /* 3. Global Centering: Applied to standard Tables and modern DataFrames */
+    [data-testid="stTable"] th, 
+    [data-testid="stTable"] td,
+    [data-testid="stDataFrame"] th,
+    [data-testid="stDataFrame"] [data-testid="styled-table-cell"] {
+        text-align: center !important;
+    }
+
+    /* 4. Individual Player Audit Summary Box: Short width and Left-aligned content */
+    .summary-container {
+        width: 400px;
+    }
+    
+    /* Overrides global centering specifically inside the summary box */
+    .summary-container [data-testid="stTable"] td {
+        text-align: left !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -156,6 +152,7 @@ if 'engine' not in st.session_state:
     st.session_state.engine = SelectionsEngine()
     st.session_state.players_db = {}
     st.session_state.processed_files = False
+    st.session_state.sorted_leaderboard_names = []
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -182,13 +179,16 @@ with st.sidebar:
                 data = st.session_state.engine.parse_tournament_file(content)
                 
                 if data:
-                    # Logic: Check if tournament date falls within any defined Quadrimester period
                     q_info = next((q for q in st.session_state.quad_ranges if q['start'] <= data['date'] < q['end']), None)
                     if q_info:
                         for p in data['players']:
                             name = p['name']
                             if name not in db:
-                                db[name] = {"history": [], "total_games": 0, "tournaments": 0, "quads": set(), "major_count": 0, "recent_count": 0, "current_rating": 0}
+                                db[name] = {
+                                    "history": [], "total_games": 0, "tournaments": 0, 
+                                    "quads": set(), "major_count": 0, "recent_count": 0, 
+                                    "current_rating": 0, "latest_rating_date": datetime(1900, 1, 1)
+                                }
                             
                             db[name]["history"].append({
                                 "Date": data['date'].strftime('%Y-%m-%d'),
@@ -203,7 +203,12 @@ with st.sidebar:
                             db[name]["total_games"] += p['games']
                             db[name]["tournaments"] += 1
                             db[name]["quads"].add(q_info['quad'])
-                            db[name]["current_rating"] = p['new_rating']
+                            
+                            # Deterministic Current Rating Logic
+                            if data['date'] >= db[name]["latest_rating_date"]:
+                                db[name]["latest_rating_date"] = data['date']
+                                db[name]["current_rating"] = p['new_rating']
+                                
                             if data['is_major']: db[name]["major_count"] += 1
                             if q_info['quad'] >= 4: db[name]["recent_count"] += 1
             
@@ -213,7 +218,7 @@ with st.sidebar:
                 st.rerun()
 
 # --- MAIN DASHBOARD ---
-st.title("National Scrabble Selections Management Portal")
+st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
 tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria"])
@@ -225,7 +230,7 @@ with tabs[0]:
         c1.metric("Tournament", st.session_state.config['mode'])
         c2.metric("Cutoff Date", st.session_state.config['cutoff_date'].strftime('%d %b %Y'))
         c3.metric("Min Games Req", st.session_state.config['req_games'])
-        c4.metric("Recent Activity", f"{st.session_state.config['req_recent']} Tours")
+        c4.metric("Recent Activity", f"{st.session_state.config['req_recent']} Tournaments")
         
         st.subheader("Quadrimester Weighting Schedule")
         q_df = pd.DataFrame(st.session_state.quad_ranges)
@@ -256,26 +261,26 @@ with tabs[1]:
             
             rows.append({
                 "Player Name": name, "WAR": war, 
-                "Current Rating": data['current_rating'], # PDF Page 6: Tie Breaker 1
-                "WAR Precise": round(war_precise, 2),    # PDF Page 6: Tie Breaker 2
+                "Current Rating": data['current_rating'],
+                "WAR Precise": round(war_precise, 2),
                 "Quads": len(data['quads']), 
-                "Tours": data['tournaments'], "Total Games": data['total_games'], 
+                "Tournaments": data['tournaments'], "Total Games": data['total_games'], 
                 "Status": "QUALIFIED" if eligible else "INELIGIBLE"
             })
         
         if rows:
             df = pd.DataFrame(rows).sort_values(by=["WAR", "Current Rating", "WAR Precise"], ascending=False).reset_index(drop=True)
-            df.index += 1
+            st.session_state.sorted_leaderboard_names = df["Player Name"].tolist()
+            df.index = range(1, len(df) + 1)
             
             def color_status(val):
                 color = '#28a745' if val == "QUALIFIED" else '#dc3545'
                 return f'color: {color}; font-weight: bold;'
 
-            # FIX: Updated applymap to map for Pandas 2.1+ compatibility
             st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
             
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Export Results (CSV)", data=csv, file_name="rankings.csv", mime='text/csv')
+            st.download_button("Export National Rankings (CSV)", data=csv, file_name="national_rankings.csv", mime='text/csv')
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
@@ -286,20 +291,99 @@ with tabs[2]:
         if player_select:
             p_data = st.session_state.players_db[player_select]
             st.subheader(f"Participation History: {player_select}")
-            st.dataframe(pd.DataFrame(p_data["history"]), use_container_width=True)
+            
+            # Sort by Latest Date First for Display
+            p_df = pd.DataFrame(p_data["history"])
+            p_df['Date_dt'] = pd.to_datetime(p_df['Date'])
+            p_df = p_df.sort_values(by="Date_dt", ascending=False).drop(columns=['Date_dt'])
+            p_df.index = range(1, len(p_df) + 1)
+            
+            st.dataframe(p_df, use_container_width=True)
+            
+            # Calculations for Summary
+            total_w = sum(h['Weight'] for h in p_data['history'])
+            total_wv = sum(h['WeightedVal'] for h in p_data['history'])
+            total_g = p_data['total_games']
+            calc_war = round(total_wv / total_w) if total_w > 0 else 0
+            
+            st.markdown("### Player Record Summary")
+            summary_df = pd.DataFrame({
+                "Metric": ["Distinct Quadrimesters", "Aggregate Weight", "Total Weighted Value", "Cumulative Games", "Calculated WAR"],
+                "Value": [len(p_data['quads']), f"{total_w:.2f}", f"{total_wv:,.2f}", p_data['total_games'], calc_war]
+            })
+
+            # Force values to strings to prevent the Arrow conversion error
+            summary_df['Value'] = summary_df['Value'].astype(str)
+
+            st.markdown('<div class="summary-container">', unsafe_allow_html=True)
+            st.table(summary_df)
+            st.markdown('</div>', unsafe_allow_html=True)
+                        
+            # Individual Export
+            indiv_buffer = io.StringIO()
+            indiv_buffer.write(f"Player Name: {player_select}\n\n")
+            p_df.to_csv(indiv_buffer, index=False)
+            st.download_button(
+                label=f"Export {player_select} Results",
+                data=indiv_buffer.getvalue().encode('utf-8'),
+                file_name=f"{player_select.replace(' ', '_')}_WAR.csv",
+                mime='text/csv'
+            )
+            
+            st.markdown("---")
+            # Master Export with Summary Rows
+            if st.button("Generate Master WAR Breakdown"):
+                master_buffer = io.StringIO()
+                for name in st.session_state.sorted_leaderboard_names:
+                    data = st.session_state.players_db[name]
+                    master_buffer.write(f"Player Name: {name}\n")
+                    
+                    # Chronological history for CSV
+                    h_df = pd.DataFrame(data["history"])
+                    h_df.to_csv(master_buffer, index=False)
+                    
+                    # Calculation of Summary Line
+                    m_w = sum(h['Weight'] for h in data['history'])
+                    m_wv = sum(h['WeightedVal'] for h in data['history'])
+                    m_g = data['total_games']
+                    m_war = round(m_wv / m_w) if m_w > 0 else 0
+                    
+                    # Write Summary Row matching the column structure
+                    # Aligning values under relevant columns (Weight, WeightedVal, Games, WAR)
+                    master_buffer.write(f"SUMMARY,,,Total Weight,Total Weighted Val,Total Games,Calculated WAR\n")
+                    master_buffer.write(f",,,{m_w:.2f},{m_wv:.2f},{m_g},{m_war}\n")
+                    
+                    master_buffer.write("\n\n\n\n") 
+                
+                st.download_button(
+                    label="Download Master WAR Breakdown (CSV)",
+                    data=master_buffer.getvalue().encode('utf-8'),
+                    file_name="WAR_breakdown_master.csv",
+                    mime='text/csv'
+                )
     else:
         st.info("Awaiting data processing.")
 
 # TAB 4: POLICY
 with tabs[3]:
     st.header("National Selection Policy Summary")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("WSC Selection")
-        st.markdown("- **Window:** 20 Months\n- **Games:** 80 Min\n- **Recency:** 2 tours in Q4/Q5\n- **Buffer:** 6 Months")
-    with col_b:
-        st.subheader("WYSC Selection")
-        st.markdown("- **Window:** 20 Months\n- **Games:** 50 Min\n- **Recency:** 1 tour in Q4/Q5\n- **Buffer:** 3 Months")
+    
+    st.subheader("World Scrabble Championship (WSC) Selection Criteria")
+    st.write("""
+    Candidates seeking selection for the World Scrabble Championship (WSC) must demonstrate consistent performance and activity within 
+    a 20-month evaluation window. Eligibility is predicated on completing a minimum of 80 rated games across at least five tournaments 
+    spanning no fewer than three distinct quadrimesters. This participation must include at least one 18-round 'Major' event. 
+    Furthermore, candidates must demonstrate current form by participating in at least two rated tournaments during the most recent 
+    eight-month period (Quadrimesters 4 and 5), following a mandatory six-month buffer period prior to the international event.
+    """)
+
+    st.subheader("World Youth Scrabble Championship (WYSC) Selection Criteria")
+    st.write("""
+    Candidates for the World Youth Scrabble Championship (WYSC) and associated youth international events must complete a minimum of 
+    50 rated games within the 20-month selection window. Eligibility requires participation in a minimum of three tournaments 
+    held across at least three different quadrimesters, including one 18-round major event. To validate recent competitive standing, 
+    at least one tournament must fall within the final two quadrimesters (Q4/Q5) of the window, following a three-month buffer period.
+    """)
     
     st.markdown("---")
     st.subheader("Official Documentation")
@@ -309,3 +393,4 @@ with tabs[3]:
             st.download_button("Download Official Criteria PDF", data=f, file_name="Selections_Criteria_2024.pdf")
     
     st.link_button("Read Technical Documentation on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
+    st.link_button("Read about the National Scrabble Selections Process on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
