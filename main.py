@@ -392,5 +392,5 @@ with tabs[3]:
         with open(pdf_path, "rb") as f:
             st.download_button("Download Official Criteria PDF", data=f, file_name="Selections_Criteria_2024.pdf")
     
-    st.link_button("Read Technical Documentation on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
+    st.link_button("Read Technical Documentation on Medium", "https://medium.com/@imethdesilva/technical-documentation-nss-war-calculator-4c7641c9875d")
     st.link_button("Read about the National Scrabble Selections Process on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
