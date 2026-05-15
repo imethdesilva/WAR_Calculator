@@ -5,6 +5,49 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
 import io
+import google.generativeai as genai
+import PyPDF2
+
+genai.configure(api_key=st.secrets["GEMINI_KEY"])
+model = genai.GenerativeModel('gemini-2.5-flash')
+
+def load_pdf_text(filename):
+    if not os.path.exists(filename):
+        return ""
+    try:
+        text = ""
+        with open(filename, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                content = page.extract_text()
+                if content:
+                    text += content + "\n"
+        return text
+    except Exception as e:
+        return f"Error reading PDF: {e}"
+
+SYSTEM_INSTRUCTION = """
+# IDENTITY
+You are MUUMUUS, the intelligent AI Consultant for the Scrabble Federation of Sri Lanka. 
+
+# BEHAVIOR GUIDELINES
+- DO NOT introduce yourself or state your name in every response. Only state your name if the user specifically asks who you are or at the very beginning of a new session.
+- Maintain a natural, fluid conversation. Refer back to previous things the user said when appropriate (e.g., "As we discussed earlier regarding your game count...").
+- Be professional, warm, and helpful. You are a consultant, not a robot.
+
+# CITATION PROTOCOL
+- You must always cite the official selection criteria PDF. Example: "According to Page 6, Section 2..."
+- Use the provided context to answer questions accurately.
+
+# CORE RULES
+- WAR window: 20 months.
+- Quads: Jan-Apr, May-Aug, Sep-Dec.
+- WSC: 80 games / 5 tours.
+- WYSC: 50 games / 3 tours.
+- Tie-break: 1st Current Rating, 2nd WAR (2 decimals).
+"""
+
+PDF_CONTENT = load_pdf_text("Selections Criteria 2024.pdf")
 
 class SelectionsEngine:
     def __init__(self):
@@ -31,24 +74,18 @@ class SelectionsEngine:
             offset = 6 if mode == "WSC" else 3
             cutoff_date = intl_date - relativedelta(months=offset)
             
-            # 1. Determine Candidate Quad 5 (The Season the Cutoff falls into)
             q5_start, q5_end = self.get_season_bounds(cutoff_date)
-            
-            # 2. Check Activity in Candidate Quad 5
-            # Identify tournaments that fall within this season up to the cutoff
+
             tours_in_q5 = [d for d in tournament_dates if q5_start <= d <= cutoff_date]
-            
-            # 3. Apply the "Skip" and "First Month" Rules
+
             is_first_month = (cutoff_date.month in [1, 5, 9])
-            
-            # If no tournaments OR (First month AND exactly one tournament)
+
             if len(tours_in_q5) == 0 or (is_first_month and len(tours_in_q5) == 1):
-                # Anchor shifts to the previous season
+
                 actual_q5_end = self.get_prev_season_end(q5_start)
             else:
                 actual_q5_end = q5_end
 
-            # 4. Build the 5 Quads stepping back through Seasons
             quads = []
             curr_end = actual_q5_end
             weights = [2.0, 1.75, 1.50, 1.25, 1.0] # PDF page 3
@@ -101,7 +138,6 @@ class SelectionsEngine:
             line = line.strip()
             if not line: continue
 
-            # Detect game headers (e.g., "24 games", "9 games")
             game_header = re.search(r'(\d+)\s+games', line.lower())
             if game_header:
                 current_section_games = int(game_header.group(1))
@@ -109,31 +145,21 @@ class SelectionsEngine:
                     is_major_tournament = True
                 continue
 
-            # Detect player rows (lines starting with a rank number)
             if re.match(r'^\d+\s+', line):
-                # Extract all numeric/rating-like blocks including decimals and parentheses
                 numeric_blocks = re.findall(r'\(?\s*[\d\-+.]+\s*\)?', line)
                 if len(numeric_blocks) < 2: continue 
                 
                 try:
-                    # New rating is always the very last numeric block
                     new_rating = int(float(numeric_blocks[-1].replace('(', '').replace(')', '').strip()))
-                    
-                    # Old rating logic: if there are 3+ rating/change blocks at the end
-                    # We assume old rating is the 3rd from the end (Old, Chg, New)
-                    # If not, we set it to 0
+
                     old_rating = 0
-                    if len(numeric_blocks) >= 5: # Rank + Wins + Spread + Old + New (min 5 blocks)
+                    if len(numeric_blocks) >= 5:
                          try:
                             old_rating = int(float(numeric_blocks[-3].replace('(', '').replace(')', '').strip()))
                          except: pass
 
-                    # CLEAN NAME LOGIC
-                    # 1. Strip the prefix: Rank, Wins (7.5), and Spread (+1234*)
                     name_part = re.sub(r'^\s*\d+\s+[\d\-+.]+\s+[\d\-+*&.]+', '', raw_line)
-                    # 2. Strip the suffix: Rating blocks and metadata from the end
                     name_part = re.sub(r'[\d\-+*&\(\)\s.]+$', '', name_part)
-                    # 3. Final cleanup of whitespace and leading status symbols
                     name_part = name_part.strip().strip('*&').strip()
                     
                     if name_part:
@@ -141,7 +167,7 @@ class SelectionsEngine:
                             "name": name_part, 
                             "old_rating": old_rating,
                             "new_rating": new_rating, 
-                            "games": current_section_games # Crucial: links player to their specific section
+                            "games": current_section_games
                         })
                 except: continue
 
@@ -224,7 +250,7 @@ with st.sidebar:
     
     if uploaded_files:
         if st.button("Process Tournament Results"):
-            # PHASE 1: Pre-parse files to identify the Quad Structure
+          
             all_tour_dates = []
             parsed_tournament_objects = []
             
@@ -239,8 +265,6 @@ with st.sidebar:
                 st.error("No valid tournament data found in uploaded files.")
                 st.stop()
 
-            # PHASE 2: Determine Quads based on detected dates and the PDF "Skip/Shift" rules
-            # We call the function using the dates we just found
             config, quads = st.session_state.engine.calculate_configuration(
                 selected_mode, 
                 event_date, 
@@ -250,16 +274,15 @@ with st.sidebar:
             if config:
                 st.session_state.config = config
                 st.session_state.quad_ranges = quads
-                
-                # PHASE 3: Process the ratings using the newly calculated Quad weights
+
                 db = {}
                 for data in parsed_tournament_objects:
-                    # Find which quad this tournament belongs to (inclusive of start/end)
+
                     q_info = next((q for q in st.session_state.quad_ranges 
                                  if q['start'] <= data['date'] <= q['end']), None)
                     
                     if q_info:
-                        # 1. Group players within this specific file to handle multi-sections
+
                         file_summary = {}
                         for p in data['players']:
                             name = p['name']
@@ -267,9 +290,8 @@ with st.sidebar:
                                 file_summary[name] = {"games": 0, "old": p['old_rating'], "new": p['new_rating']}
                             
                             file_summary[name]["games"] += p['games']
-                            file_summary[name]["new"] = p['new_rating'] # Take the latest rating in the file
+                            file_summary[name]["new"] = p['new_rating'] 
 
-                        # 2. Add the summarized player data to the main database
                         for name, p_file_data in file_summary.items():
                             if name not in db:
                                 db[name] = {
@@ -293,16 +315,13 @@ with st.sidebar:
                             db[name]["tournaments"] += 1
                             db[name]["quads"].add(q_info['quad'])
                             
-                            # Deterministic Current Rating Logic
                             if data['date'] >= db[name]["latest_rating_date"]:
                                 db[name]["latest_rating_date"] = data['date']
                                 db[name]["current_rating"] = p_file_data['new']
                                 
-                            # Eligibility: Checks if personal game count is 18+ OR if file flagged as Major
                             if p_file_data['games'] >= 18 or data['is_major']: 
                                 db[name]["major_count"] += 1
                             
-                            # Recency Check: Uses the newly calculated Q4/Q5 weights
                             if q_info['quad'] >= 4: 
                                 db[name]["recent_count"] += 1
                 
@@ -321,7 +340,7 @@ with st.sidebar:
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
-tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria"])
+tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria", "AI Assistant"])
 
 # Overview
 with tabs[0]:
@@ -363,7 +382,7 @@ with tabs[1]:
                 "Player Name": name, 
                 "WAR": war, 
                 "Current Rating": data['current_rating'],
-                "WAR Precise": round(war_precise, 2),  # <--- ADD THIS LINE
+                "WAR Precise": round(war_precise, 2), 
                 "Quads": len(data['quads']), 
                 "Tournaments": data['tournaments'], 
                 "Total Games": data['total_games'], 
@@ -433,7 +452,7 @@ with tabs[2]:
             )
             
             st.markdown("---")
-            # Master Export
+
             if st.button("Generate Master WAR Breakdown"):
                 master_buffer = io.StringIO()
                 for name in st.session_state.sorted_leaderboard_names:
@@ -492,3 +511,76 @@ with tabs[3]:
     
     st.link_button("Read Technical Documentation on Medium", "https://medium.com/@imethdesilva/technical-documentation-nss-war-calculator-4c7641c9875d")
     st.link_button("Read about the National Scrabble Selections Process on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
+
+with tabs[4]:
+    st.header("AI Selection Assistant")
+
+    if PDF_CONTENT:
+        st.success(" MUUMUUS is online and has read the Selection Criteria.")
+    else:
+        st.warning("MUUMUUS is online but the Criteria PDF was not found.")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask MUUMUUS about WSC/WYSC rules..."):
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        context_for_ai = f"""
+        {SYSTEM_INSTRUCTION}
+        
+        REFERENCE DOCUMENT CONTENT:
+        {PDF_CONTENT}
+        
+        CONVERSATION HISTORY:
+        """
+        for msg in st.session_state.messages[-6:]:
+            role_name = "Player" if msg["role"] == "user" else "MUUMUUS"
+            context_for_ai += f"{role_name}: {msg['content']}\n"
+
+        context_for_ai += f"\nMUUMUUS, please respond to the player's latest request while citing the PDF accurately."
+
+        try:
+           
+            response = model.generate_content(context_for_ai)
+            answer = response.text
+            
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+            
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            
+        except Exception as e:
+            st.error(f"MUUMUUS encountered an error: {e}")
+            st.info("Check the Developer Panel below to verify your API Key and Model status.")
+
+    st.markdown("---")
+    with st.expander("🛠️ Developer Panel"):
+        st.write("Use these tools to manage the AI session.")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("List Available Models"):
+                try:
+                    available_models = []
+                    for m in genai.list_models():
+                        if 'generateContent' in m.supported_generation_methods:
+                            available_models.append(m.name)
+                    st.json(available_models)
+                    
+                    current_model_name = "models/gemini-1.5-flash-latest"
+                    if any(current_model_name in m for m in available_models):
+                        st.success(f"Confirmed: {current_model_name} is active.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+        
+        with col2:
+            if st.button("Clear History & Reset MUUMUUS"):
+                st.session_state.messages = []
+                st.rerun()
