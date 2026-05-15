@@ -11,12 +11,58 @@ class SelectionsEngine:
         self.quad_ranges = []
         self.config = {}
 
-    def calculate_configuration(self, mode, intl_date_str):
+    def get_season_bounds(self, date):
+        """Returns the fixed (start, end) of the season a date falls into."""
+        year = date.year
+        if 1 <= date.month <= 4:
+            return datetime(year, 1, 1), datetime(year, 4, 30)
+        elif 5 <= date.month <= 8:
+            return datetime(year, 5, 1), datetime(year, 8, 31)
+        else:
+            return datetime(year, 9, 1), datetime(year, 12, 31)
+
+    def get_prev_season_end(self, start_date):
+        """Returns the end date of the previous fixed season."""
+        return start_date - relativedelta(days=1)
+    
+    def calculate_configuration(self, mode, intl_date_str, tournament_dates=[]):
         try:
             intl_date = datetime.strptime(intl_date_str, "%d.%m.%Y")
             offset = 6 if mode == "WSC" else 3
             cutoff_date = intl_date - relativedelta(months=offset)
             
+            # 1. Determine Candidate Quad 5 (The Season the Cutoff falls into)
+            q5_start, q5_end = self.get_season_bounds(cutoff_date)
+            
+            # 2. Check Activity in Candidate Quad 5
+            # Identify tournaments that fall within this season up to the cutoff
+            tours_in_q5 = [d for d in tournament_dates if q5_start <= d <= cutoff_date]
+            
+            # 3. Apply the "Skip" and "First Month" Rules
+            is_first_month = (cutoff_date.month in [1, 5, 9])
+            
+            # If no tournaments OR (First month AND exactly one tournament)
+            if len(tours_in_q5) == 0 or (is_first_month and len(tours_in_q5) == 1):
+                # Anchor shifts to the previous season
+                actual_q5_end = self.get_prev_season_end(q5_start)
+            else:
+                actual_q5_end = q5_end
+
+            # 4. Build the 5 Quads stepping back through Seasons
+            quads = []
+            curr_end = actual_q5_end
+            weights = [2.0, 1.75, 1.50, 1.25, 1.0] # PDF page 3
+            
+            for i in range(5, 0, -1):
+                q_start, q_end = self.get_season_bounds(curr_end)
+                quads.append({
+                    "quad": i, 
+                    "start": q_start, 
+                    "end": q_end, 
+                    "weight": weights[5-i]
+                })
+                curr_end = self.get_prev_season_end(q_start)
+
             config = {
                 "mode": mode,
                 "intl_date": intl_date,
@@ -27,14 +73,6 @@ class SelectionsEngine:
                 "min_quads": 3,
                 "min_war": 800
             }
-
-            quads = []
-            curr_end = cutoff_date
-            for i in range(5, 0, -1):
-                start = curr_end - relativedelta(months=4)
-                weight = 1.0 + (i-1)*0.25
-                quads.append({"quad": i, "start": start, "end": curr_end, "weight": weight})
-                curr_end = start
             
             return config, quads
         except Exception as e:
@@ -45,7 +83,7 @@ class SelectionsEngine:
         lines = content.splitlines()
         t_date, t_name = None, "Unknown Tournament"
         
-        for line in lines[:2]:
+        for line in lines[:5]:
             date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', line)
             if date_match:
                 t_date = datetime.strptime(date_match.group(1), "%d.%m.%Y")
@@ -56,46 +94,61 @@ class SelectionsEngine:
         
         players_found = []
         current_section_games = 0
+        is_major_tournament = False 
 
         for line in lines:
             raw_line = line
             line = line.strip()
             if not line: continue
 
-            game_header = re.search(r'^(\d+)\s+games', line.lower())
+            # Detect game headers (e.g., "24 games", "9 games")
+            game_header = re.search(r'(\d+)\s+games', line.lower())
             if game_header:
                 current_section_games = int(game_header.group(1))
+                if current_section_games >= 18:
+                    is_major_tournament = True
                 continue
 
+            # Detect player rows (lines starting with a rank number)
             if re.match(r'^\d+\s+', line):
-                numeric_blocks = re.findall(r'\(?\s*[\d\-+]+\s*\)?', line)
+                # Extract all numeric/rating-like blocks including decimals and parentheses
+                numeric_blocks = re.findall(r'\(?\s*[\d\-+.]+\s*\)?', line)
                 if len(numeric_blocks) < 2: continue 
                 
                 try:
-                    new_rating = int(numeric_blocks[-1].replace('(', '').replace(')', '').strip())
+                    # New rating is always the very last numeric block
+                    new_rating = int(float(numeric_blocks[-1].replace('(', '').replace(')', '').strip()))
+                    
+                    # Old rating logic: if there are 3+ rating/change blocks at the end
+                    # We assume old rating is the 3rd from the end (Old, Chg, New)
+                    # If not, we set it to 0
                     old_rating = 0
-                    if len(numeric_blocks) >= 3:
-                        try:
-                            old_rating = int(numeric_blocks[-3].replace('(', '').replace(')', '').strip())
-                        except: pass
+                    if len(numeric_blocks) >= 5: # Rank + Wins + Spread + Old + New (min 5 blocks)
+                         try:
+                            old_rating = int(float(numeric_blocks[-3].replace('(', '').replace(')', '').strip()))
+                         except: pass
 
-                    name_part = re.sub(r'^\s*\d+\s+[\d\-+]+\s+[\d\-+*&]+\s+', '', raw_line)
-                    name_part = re.sub(r'[\d\-+*&\(\)\s]+$', '', name_part).strip()
-                    name_part = name_part.lstrip('*') 
+                    # CLEAN NAME LOGIC
+                    # 1. Strip the prefix: Rank, Wins (7.5), and Spread (+1234*)
+                    name_part = re.sub(r'^\s*\d+\s+[\d\-+.]+\s+[\d\-+*&.]+', '', raw_line)
+                    # 2. Strip the suffix: Rating blocks and metadata from the end
+                    name_part = re.sub(r'[\d\-+*&\(\)\s.]+$', '', name_part)
+                    # 3. Final cleanup of whitespace and leading status symbols
+                    name_part = name_part.strip().strip('*&').strip()
                     
                     if name_part:
                         players_found.append({
                             "name": name_part, 
                             "old_rating": old_rating,
                             "new_rating": new_rating, 
-                            "games": current_section_games
+                            "games": current_section_games # Crucial: links player to their specific section
                         })
                 except: continue
 
         return {
             "name": t_name, 
             "date": t_date, 
-            "is_major": (current_section_games >= 18), 
+            "is_major": is_major_tournament, 
             "players": players_found
         }
 
@@ -169,18 +222,55 @@ with st.sidebar:
     st.subheader("Data Ingestion")
     uploaded_files = st.file_uploader("Upload Tournament Files (.txt)", accept_multiple_files=True)
     
-    if uploaded_files and 'config' in st.session_state:
+    if uploaded_files:
         if st.button("Process Tournament Results"):
-            db = {}
+            # PHASE 1: Pre-parse files to identify the Quad Structure
+            all_tour_dates = []
+            parsed_tournament_objects = []
+            
             for f in uploaded_files:
                 content = f.read().decode('utf-8', errors='ignore')
                 data = st.session_state.engine.parse_tournament_file(content)
-                
                 if data:
-                    q_info = next((q for q in st.session_state.quad_ranges if q['start'] <= data['date'] < q['end']), None)
+                    all_tour_dates.append(data['date'])
+                    parsed_tournament_objects.append(data)
+
+            if not all_tour_dates:
+                st.error("No valid tournament data found in uploaded files.")
+                st.stop()
+
+            # PHASE 2: Determine Quads based on detected dates and the PDF "Skip/Shift" rules
+            # We call the function using the dates we just found
+            config, quads = st.session_state.engine.calculate_configuration(
+                selected_mode, 
+                event_date, 
+                tournament_dates=all_tour_dates
+            )
+            
+            if config:
+                st.session_state.config = config
+                st.session_state.quad_ranges = quads
+                
+                # PHASE 3: Process the ratings using the newly calculated Quad weights
+                db = {}
+                for data in parsed_tournament_objects:
+                    # Find which quad this tournament belongs to (inclusive of start/end)
+                    q_info = next((q for q in st.session_state.quad_ranges 
+                                 if q['start'] <= data['date'] <= q['end']), None)
+                    
                     if q_info:
+                        # 1. Group players within this specific file to handle multi-sections
+                        file_summary = {}
                         for p in data['players']:
                             name = p['name']
+                            if name not in file_summary:
+                                file_summary[name] = {"games": 0, "old": p['old_rating'], "new": p['new_rating']}
+                            
+                            file_summary[name]["games"] += p['games']
+                            file_summary[name]["new"] = p['new_rating'] # Take the latest rating in the file
+
+                        # 2. Add the summarized player data to the main database
+                        for name, p_file_data in file_summary.items():
                             if name not in db:
                                 db[name] = {
                                     "history": [], "total_games": 0, "tournaments": 0, 
@@ -193,22 +283,34 @@ with st.sidebar:
                                 "Tournament": data['name'],
                                 "Quad": q_info['quad'],
                                 "Weight": q_info['weight'],
-                                "Old Rating": p['old_rating'],
-                                "New Rating": p['new_rating'],
-                                "WeightedVal": p['new_rating'] * q_info['weight'],
-                                "Games": p['games']
+                                "Old Rating": p_file_data['old'],
+                                "New Rating": p_file_data['new'],
+                                "WeightedVal": p_file_data['new'] * q_info['weight'],
+                                "Games": p_file_data['games']
                             })
-                            db[name]["total_games"] += p['games']
+                            
+                            db[name]["total_games"] += p_file_data['games']
                             db[name]["tournaments"] += 1
                             db[name]["quads"].add(q_info['quad'])
                             
                             # Deterministic Current Rating Logic
                             if data['date'] >= db[name]["latest_rating_date"]:
                                 db[name]["latest_rating_date"] = data['date']
-                                db[name]["current_rating"] = p['new_rating']
+                                db[name]["current_rating"] = p_file_data['new']
                                 
-                            if data['is_major']: db[name]["major_count"] += 1
-                            if q_info['quad'] >= 4: db[name]["recent_count"] += 1
+                            # Eligibility: Checks if personal game count is 18+ OR if file flagged as Major
+                            if p_file_data['games'] >= 18 or data['is_major']: 
+                                db[name]["major_count"] += 1
+                            
+                            # Recency Check: Uses the newly calculated Q4/Q5 weights
+                            if q_info['quad'] >= 4: 
+                                db[name]["recent_count"] += 1
+                
+                if db:
+                    st.session_state.players_db = db
+                    st.session_state.processed_files = True
+                    st.success("Calculated WAR using Seasonal Calendar Weights")
+                    st.rerun()
             
             if db:
                 st.session_state.players_db = db
@@ -258,14 +360,18 @@ with tabs[1]:
                         data['recent_count'] >= conf['req_recent'])
             
             rows.append({
-                "Player Name": name, "WAR": war, 
+                "Player Name": name, 
+                "WAR": war, 
                 "Current Rating": data['current_rating'],
-                "WAR Precise": round(war_precise, 2),
+                "WAR Precise": round(war_precise, 2),  # <--- ADD THIS LINE
                 "Quads": len(data['quads']), 
-                "Tournaments": data['tournaments'], "Total Games": data['total_games'], 
+                "Tournaments": data['tournaments'], 
+                "Total Games": data['total_games'], 
+                "Majors": data['major_count'],
+                "Recent": data['recent_count'],
                 "Status": "QUALIFIED" if eligible else "INELIGIBLE"
             })
-        
+
         if rows:
             df = pd.DataFrame(rows).sort_values(by=["WAR", "Current Rating", "WAR Precise"], ascending=False).reset_index(drop=True)
             st.session_state.sorted_leaderboard_names = df["Player Name"].tolist()
