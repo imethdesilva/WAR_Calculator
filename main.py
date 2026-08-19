@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import math
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
@@ -79,9 +80,11 @@ class SelectionsEngine:
             tours_in_q5 = [d for d in tournament_dates if q5_start <= d <= cutoff_date]
 
             is_first_month = (cutoff_date.month in [1, 5, 9])
+            # PDF p.3 exception: exactly one tournament in the first month of the quadrimester
+            # gets MERGED into the previous quadrimester (not dropped).
+            merge_stray_tournament = is_first_month and len(tours_in_q5) == 1
 
-            if len(tours_in_q5) == 0 or (is_first_month and len(tours_in_q5) == 1):
-
+            if len(tours_in_q5) == 0 or merge_stray_tournament:
                 actual_q5_end = self.get_prev_season_end(q5_start)
             else:
                 actual_q5_end = q5_end
@@ -89,13 +92,18 @@ class SelectionsEngine:
             quads = []
             curr_end = actual_q5_end
             weights = [2.0, 1.75, 1.50, 1.25, 1.0] # PDF page 3
-            
+
             for i in range(5, 0, -1):
                 q_start, q_end = self.get_season_bounds(curr_end)
+                if i == 5 and merge_stray_tournament:
+                    # Widen Q5's end past its natural season boundary to cutoff_date so the
+                    # lone stray tournament's date still falls inside Q5's matching range,
+                    # instead of matching no quadrimester and being silently dropped.
+                    q_end = cutoff_date
                 quads.append({
-                    "quad": i, 
-                    "start": q_start, 
-                    "end": q_end, 
+                    "quad": i,
+                    "start": q_start,
+                    "end": q_end,
                     "weight": weights[5-i]
                 })
                 curr_end = self.get_prev_season_end(q_start)
@@ -115,6 +123,58 @@ class SelectionsEngine:
         except Exception as e:
             st.error(f"Configuration Error: {str(e)}")
             return None, None
+
+    def detect_inactivity(self, history, cutoff_date):
+        """PDF p.6: a player idle for more than a year is 'inactive' and ineligible.
+        On return, their rating is restored but they need 50 rated games since
+        resumption before being reconsidered. `history` is every detectable
+        appearance for this player across ALL uploaded files (any date, provisional
+        or not) - not just the ones inside the current WAR window - since we need
+        their full timeline to spot the gap."""
+        if not history:
+            return {"status": "no_data", "remark": "", "override_ineligible": False, "games_since_resumption": None}
+
+        sorted_h = sorted(history, key=lambda x: x['date'])
+
+        resumption_idx = 0
+        for i in range(1, len(sorted_h)):
+            gap_days = (sorted_h[i]['date'] - sorted_h[i-1]['date']).days
+            if gap_days > 365:
+                resumption_idx = i
+
+        last_played = sorted_h[-1]['date']
+        trailing_gap = (cutoff_date - last_played).days > 365
+
+        if trailing_gap:
+            return {
+                "status": "inactive",
+                "remark": f"Inactive - no tournaments played since {last_played:%Y-%m-%d} (>1 year). Ineligible for selection.",
+                "override_ineligible": True,
+                "games_since_resumption": 0,
+            }
+
+        had_gap = resumption_idx > 0
+        if had_gap:
+            resumption_date = sorted_h[resumption_idx]['date']
+            games_since = sum(h['games'] for h in sorted_h[resumption_idx:] if not h.get('provisional'))
+            if games_since < 50:
+                remaining = 50 - games_since
+                return {
+                    "status": "resuming",
+                    "remark": (f"Inactive for more than a year before {resumption_date:%Y-%m-%d}. "
+                               f"WAR considered only after 50 games played since activeness "
+                               f"({games_since}/50 played, {remaining} more needed). Ineligible until then."),
+                    "override_ineligible": True,
+                    "games_since_resumption": games_since,
+                }
+            return {
+                "status": "cleared",
+                "remark": f"Previously inactive (gap ending {resumption_date:%Y-%m-%d}); {games_since} games played since resumption - restriction cleared.",
+                "override_ineligible": False,
+                "games_since_resumption": games_since,
+            }
+
+        return {"status": "active", "remark": "", "override_ineligible": False, "games_since_resumption": None}
 
     def parse_tournament_file(self, content):
         lines = content.splitlines()
@@ -150,6 +210,10 @@ class SelectionsEngine:
                 if len(numeric_blocks) < 2: continue 
                 
                 try:
+                    # A rating shown in parentheses, e.g. "( 900)", is the standard notation
+                    # for a provisional (not-yet-fully-rated) result. PDF p.2 excludes these
+                    # from WAR entirely.
+                    is_provisional = '(' in numeric_blocks[-1] or ')' in numeric_blocks[-1]
                     new_rating = int(float(numeric_blocks[-1].replace('(', '').replace(')', '').strip()))
 
                     old_rating = 0
@@ -161,22 +225,140 @@ class SelectionsEngine:
                     name_part = re.sub(r'^\s*\d+\s+[\d\-+.]+\s+[\d\-+*&.]+', '', raw_line)
                     name_part = re.sub(r'[\d\-+*&\(\)\s.]+$', '', name_part)
                     name_part = name_part.strip().strip('*&').strip()
-                    
+
                     if name_part:
                         players_found.append({
-                            "name": name_part, 
+                            "name": name_part,
                             "old_rating": old_rating,
-                            "new_rating": new_rating, 
-                            "games": current_section_games
+                            "new_rating": new_rating,
+                            "games": current_section_games,
+                            "provisional": is_provisional
                         })
                 except: continue
 
         return {
-            "name": t_name, 
-            "date": t_date, 
-            "is_major": is_major_tournament, 
+            "name": t_name,
+            "date": t_date,
+            "is_major": is_major_tournament,
             "players": players_found
         }
+
+
+def round_half_up(x):
+    """PDF: 'Weighted averages will be rounded off to the nearest integer.' Python's
+    built-in round() uses banker's rounding (round-half-to-even), which can disagree
+    with plain round-half-up exactly on .5 boundaries."""
+    return int(math.floor(x + 0.5))
+
+
+def compute_war(history):
+    total_weight = sum(h['Weight'] for h in history)
+    total_weighted = sum(h['WeightedVal'] for h in history)
+    war_precise = total_weighted / total_weight if total_weight > 0 else 0
+    return round_half_up(war_precise), war_precise
+
+
+def threshold_headers(conf):
+    return {
+        "Total Games": f"Total Games (Req ≥{conf['req_games']})",
+        "Tournaments": f"Tournaments (Req ≥{conf['req_tours']})",
+        "Quads": f"Quadrimesters (Req ≥{conf['min_quads']})",
+        "Majors": "Major Tournaments (Req ≥1)",
+        "Recent": f"Recent Activity (Req ≥{conf['req_recent']})",
+    }
+
+
+def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
+    """One row per detectable player (players_db ∪ full_history_db), so a player who
+    is inactive / has no in-window non-provisional results still shows up with a
+    Remarks explanation instead of silently vanishing from the report."""
+    rows = []
+    all_names = set(players_db.keys()) | set(full_history_db.keys())
+
+    for name in all_names:
+        data = players_db.get(name)
+        inact = inactivity_map.get(name, {"override_ineligible": False, "remark": ""})
+
+        if data:
+            war, war_precise = compute_war(data['history'])
+            current_rating = data['current_rating']
+            total_games = data['total_games']
+            tournaments = data['tournaments']
+            quads_count = len(data['quads'])
+            majors = data['major_count']
+            recent = data['recent_count']
+        else:
+            war, war_precise = 0, 0.0
+            current_rating, total_games, tournaments, quads_count, majors, recent = 0, 0, 0, 0, 0, 0
+
+        base_eligible = (war >= conf['min_war'] and
+                          total_games >= conf['req_games'] and
+                          tournaments >= conf['req_tours'] and
+                          quads_count >= conf['min_quads'] and
+                          majors >= 1 and
+                          recent >= conf['req_recent'])
+        eligible = base_eligible and not inact.get("override_ineligible", False)
+
+        remark = inact.get("remark", "")
+        if not data and not remark:
+            remark = "No qualifying (non-provisional, in-window) tournament results found."
+
+        rows.append({
+            "Player Name": name,
+            "WAR": war,
+            "Current Rating": current_rating,
+            "WAR Precise": round(war_precise, 2),
+            "Quads": quads_count,
+            "Tournaments": tournaments,
+            "Total Games": total_games,
+            "Majors": majors,
+            "Recent": recent,
+            "Status": "QUALIFIED" if eligible else "INELIGIBLE",
+            "Remarks": remark
+        })
+
+    rows.sort(key=lambda r: (r["WAR"], r["Current Rating"], r["WAR Precise"]), reverse=True)
+    return rows
+
+
+def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
+    buf = io.StringIO()
+    headers_map = threshold_headers(conf)
+
+    buf.write(f"NATIONAL SELECTIONS REPORT - {mode_label}\n")
+    buf.write(f"Cutoff Date,{conf['cutoff_date'].strftime('%Y-%m-%d')}\n")
+    buf.write(f"International Event Date,{conf['intl_date'].strftime('%Y-%m-%d')}\n")
+    buf.write(f"Min WAR,{conf['min_war']}\n\n")
+
+    buf.write("SELECTION LEADERBOARD\n")
+    lb_df = pd.DataFrame(rows_sorted)
+    lb_df.insert(0, "Rank", range(1, len(lb_df) + 1))
+    lb_df = lb_df.rename(columns=headers_map)
+    lb_df.to_csv(buf, index=False)
+    buf.write("\n\n")
+
+    buf.write("INDIVIDUAL PLAYER BREAKDOWN\n\n")
+    for row in rows_sorted:
+        name = row["Player Name"]
+        buf.write(f"Player,{name}\n")
+        data = players_db.get(name)
+        if data:
+            h_df = pd.DataFrame(data["history"])
+            h_df = h_df.sort_values(by="Date")
+            h_df.to_csv(buf, index=False)
+            war, war_precise = compute_war(data['history'])
+            tw = sum(h['Weight'] for h in data['history'])
+            twr = sum(h['WeightedVal'] for h in data['history'])
+            buf.write(f"SUMMARY: Total Weight={tw:.2f}, Total Weighted Value={twr:.2f}, "
+                      f"Total Games={data['total_games']}, Calculated WAR={war}\n")
+        else:
+            buf.write("No qualifying (non-provisional, in-window) tournament history found.\n")
+        if row["Remarks"]:
+            buf.write(f"Remark,{row['Remarks']}\n")
+        buf.write("\n\n")
+
+    return buf.getvalue()
+
 
 # UI
 st.set_page_config(page_title="National Selections Dashboard", layout="wide")
@@ -229,6 +411,8 @@ st.markdown("""
 if 'engine' not in st.session_state:
     st.session_state.engine = SelectionsEngine()
     st.session_state.players_db = {}
+    st.session_state.full_history_db = {}
+    st.session_state.inactivity_map = {}
     st.session_state.processed_files = False
     st.session_state.sorted_leaderboard_names = []
 
@@ -276,64 +460,82 @@ with st.sidebar:
                 st.session_state.quad_ranges = quads
 
                 db = {}
+                # Every detectable player across ALL uploaded files, any date, provisional
+                # or not - used only to detect >1yr inactivity gaps (PDF p.6), never for WAR math.
+                full_history = {}
+
                 for data in parsed_tournament_objects:
 
-                    q_info = next((q for q in st.session_state.quad_ranges 
+                    q_info = next((q for q in st.session_state.quad_ranges
                                  if q['start'] <= data['date'] <= q['end']), None)
-                    
-                    if q_info:
 
-                        file_summary = {}
-                        for p in data['players']:
-                            name = p['name']
-                            if name not in file_summary:
-                                file_summary[name] = {"games": 0, "old": p['old_rating'], "new": p['new_rating']}
-                            
-                            file_summary[name]["games"] += p['games']
-                            file_summary[name]["new"] = p['new_rating'] 
+                    file_summary = {}
+                    for p in data['players']:
+                        name = p['name']
+                        if name not in file_summary:
+                            file_summary[name] = {
+                                "games": 0, "old": p['old_rating'], "new": p['new_rating'],
+                                "provisional": p.get('provisional', False)
+                            }
+                        file_summary[name]["games"] += p['games']
+                        file_summary[name]["new"] = p['new_rating']
+                        file_summary[name]["provisional"] = p.get('provisional', False)
 
-                        for name, p_file_data in file_summary.items():
-                            if name not in db:
-                                db[name] = {
-                                    "history": [], "total_games": 0, "tournaments": 0, 
-                                    "quads": set(), "major_count": 0, "recent_count": 0, 
-                                    "current_rating": 0, "latest_rating_date": datetime(1900, 1, 1)
-                                }
-                            
-                            db[name]["history"].append({
-                                "Date": data['date'].strftime('%Y-%m-%d'),
-                                "Tournament": data['name'],
-                                "Quad": q_info['quad'],
-                                "Weight": q_info['weight'],
-                                "Old Rating": p_file_data['old'],
-                                "New Rating": p_file_data['new'],
-                                "WeightedVal": p_file_data['new'] * q_info['weight'],
-                                "Games": p_file_data['games']
-                            })
-                            
-                            db[name]["total_games"] += p_file_data['games']
-                            db[name]["tournaments"] += 1
-                            db[name]["quads"].add(q_info['quad'])
-                            
-                            if data['date'] >= db[name]["latest_rating_date"]:
-                                db[name]["latest_rating_date"] = data['date']
-                                db[name]["current_rating"] = p_file_data['new']
-                                
-                            if p_file_data['games'] >= 18 or data['is_major']: 
-                                db[name]["major_count"] += 1
-                            
-                            if q_info['quad'] >= 4: 
-                                db[name]["recent_count"] += 1
-                
-                if db:
-                    st.session_state.players_db = db
-                    st.session_state.processed_files = True
-                    st.success("Calculated WAR using Seasonal Calendar Weights")
-                    st.rerun()
-            
-            if db:
+                    for name, p_file_data in file_summary.items():
+                        full_history.setdefault(name, []).append({
+                            "date": data['date'],
+                            "games": p_file_data['games'],
+                            "provisional": p_file_data['provisional']
+                        })
+
+                        # PDF p.2: provisional-rated results are excluded from WAR entirely.
+                        if p_file_data['provisional']:
+                            continue
+                        if not q_info:
+                            continue
+
+                        if name not in db:
+                            db[name] = {
+                                "history": [], "total_games": 0, "tournaments": 0,
+                                "quads": set(), "major_count": 0, "recent_count": 0,
+                                "current_rating": 0, "latest_rating_date": datetime(1900, 1, 1)
+                            }
+
+                        db[name]["history"].append({
+                            "Date": data['date'].strftime('%Y-%m-%d'),
+                            "Tournament": data['name'],
+                            "Quad": q_info['quad'],
+                            "Weight": q_info['weight'],
+                            "Old Rating": p_file_data['old'],
+                            "New Rating": p_file_data['new'],
+                            "WeightedVal": p_file_data['new'] * q_info['weight'],
+                            "Games": p_file_data['games']
+                        })
+
+                        db[name]["total_games"] += p_file_data['games']
+                        db[name]["tournaments"] += 1
+                        db[name]["quads"].add(q_info['quad'])
+
+                        if data['date'] >= db[name]["latest_rating_date"]:
+                            db[name]["latest_rating_date"] = data['date']
+                            db[name]["current_rating"] = p_file_data['new']
+
+                        if p_file_data['games'] >= 18 or data['is_major']:
+                            db[name]["major_count"] += 1
+
+                        if q_info['quad'] >= 4:
+                            db[name]["recent_count"] += 1
+
+                inactivity_map = {
+                    name: st.session_state.engine.detect_inactivity(hist, config['cutoff_date'])
+                    for name, hist in full_history.items()
+                }
+
                 st.session_state.players_db = db
+                st.session_state.full_history_db = full_history
+                st.session_state.inactivity_map = inactivity_map
                 st.session_state.processed_files = True
+                st.success("Calculated WAR using Seasonal Calendar Weights")
                 st.rerun()
 
 # Main
@@ -362,48 +564,35 @@ with tabs[0]:
 # Leaderboard
 with tabs[1]:
     if st.session_state.processed_files:
-        rows = []
         conf = st.session_state.config
-        for name, data in st.session_state.players_db.items():
-            tw = sum(h['Weight'] for h in data['history'])
-            twr = sum(h['WeightedVal'] for h in data['history'])
-            
-            war_precise = twr / tw if tw > 0 else 0
-            war = round(war_precise)
-            
-            eligible = (war >= conf['min_war'] and 
-                        data['total_games'] >= conf['req_games'] and 
-                        data['tournaments'] >= conf['req_tours'] and 
-                        len(data['quads']) >= 3 and 
-                        data['major_count'] >= 1 and 
-                        data['recent_count'] >= conf['req_recent'])
-            
-            rows.append({
-                "Player Name": name, 
-                "WAR": war, 
-                "Current Rating": data['current_rating'],
-                "WAR Precise": round(war_precise, 2), 
-                "Quads": len(data['quads']), 
-                "Tournaments": data['tournaments'], 
-                "Total Games": data['total_games'], 
-                "Majors": data['major_count'],
-                "Recent": data['recent_count'],
-                "Status": "QUALIFIED" if eligible else "INELIGIBLE"
-            })
+        rows = build_leaderboard_rows(
+            st.session_state.players_db,
+            st.session_state.full_history_db,
+            st.session_state.inactivity_map,
+            conf
+        )
 
         if rows:
-            df = pd.DataFrame(rows).sort_values(by=["WAR", "Current Rating", "WAR Precise"], ascending=False).reset_index(drop=True)
-            st.session_state.sorted_leaderboard_names = df["Player Name"].tolist()
+            st.session_state.sorted_leaderboard_names = [r["Player Name"] for r in rows]
+
+            df = pd.DataFrame(rows)
+            df.insert(0, "Rank", range(1, len(df) + 1))
+            df = df.rename(columns=threshold_headers(conf))
             df.index = range(1, len(df) + 1)
-            
+
             def color_status(val):
                 color = '#28a745' if val == "QUALIFIED" else '#dc3545'
                 return f'color: {color}; font-weight: bold;'
 
             st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
-            
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Export National Rankings (CSV)", data=csv, file_name="national_rankings.csv", mime='text/csv')
+
+            report_csv = generate_full_report_csv(rows, st.session_state.players_db, conf, conf['mode'])
+            st.download_button(
+                "Export Full Selection Report (CSV)",
+                data=report_csv.encode('utf-8'),
+                file_name=f"{conf['mode']}_selection_report.csv",
+                mime='text/csv'
+            )
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
@@ -426,8 +615,8 @@ with tabs[2]:
             total_w = sum(h['Weight'] for h in p_data['history'])
             total_wv = sum(h['WeightedVal'] for h in p_data['history'])
             total_g = p_data['total_games']
-            calc_war = round(total_wv / total_w) if total_w > 0 else 0
-            
+            calc_war, _ = compute_war(p_data['history'])
+
             st.markdown("### Player Record Summary")
             summary_df = pd.DataFrame({
                 "Metric": ["Distinct Quadrimesters", "Aggregate Weight", "Total Weighted Value", "Cumulative Games", "Calculated WAR"],
@@ -439,7 +628,14 @@ with tabs[2]:
             st.markdown('<div class="summary-container">', unsafe_allow_html=True)
             st.table(summary_df)
             st.markdown('</div>', unsafe_allow_html=True)
-                        
+
+            inact = st.session_state.inactivity_map.get(player_select, {})
+            if inact.get("remark"):
+                if inact.get("override_ineligible"):
+                    st.error(f"⚠️ {inact['remark']}")
+                else:
+                    st.info(f"ℹ️ {inact['remark']}")
+
             # Individual Export
             indiv_buffer = io.StringIO()
             indiv_buffer.write(f"Player Name: {player_select}\n\n")
@@ -450,34 +646,6 @@ with tabs[2]:
                 file_name=f"{player_select.replace(' ', '_')}_WAR.csv",
                 mime='text/csv'
             )
-            
-            st.markdown("---")
-
-            if st.button("Generate Master WAR Breakdown"):
-                master_buffer = io.StringIO()
-                for name in st.session_state.sorted_leaderboard_names:
-                    data = st.session_state.players_db[name]
-                    master_buffer.write(f"Player Name: {name}\n")
-
-                    h_df = pd.DataFrame(data["history"])
-                    h_df.to_csv(master_buffer, index=False)
-
-                    m_w = sum(h['Weight'] for h in data['history'])
-                    m_wv = sum(h['WeightedVal'] for h in data['history'])
-                    m_g = data['total_games']
-                    m_war = round(m_wv / m_w) if m_w > 0 else 0
-                    
-                    master_buffer.write(f"SUMMARY,,,Total Weight,Total Weighted Val,Total Games,Calculated WAR\n")
-                    master_buffer.write(f",,,{m_w:.2f},{m_wv:.2f},{m_g},{m_war}\n")
-                    
-                    master_buffer.write("\n\n\n\n") 
-                
-                st.download_button(
-                    label="Download Master WAR Breakdown (CSV)",
-                    data=master_buffer.getvalue().encode('utf-8'),
-                    file_name="WAR_breakdown_master.csv",
-                    mime='text/csv'
-                )
     else:
         st.info("Awaiting data processing.")
 
