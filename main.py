@@ -618,26 +618,49 @@ with tabs[1]:
         )
 
         if rows:
-            st.session_state.sorted_leaderboard_names = [r["Player Name"] for r in rows]
+            hide_zero_war = st.checkbox("Hide players with WAR = 0", value=False)
 
-            df = pd.DataFrame(rows)
-            df.insert(0, "Rank", range(1, len(df) + 1))
-            df = df.rename(columns=threshold_headers(conf))
-            df.index = range(1, len(df) + 1)
+            omitted_names = []
+            if conf['mode'] == 'WYSC':
+                with st.expander("Omit players from WYSC report (age not auto-verified)", expanded=False):
+                    st.caption("Age eligibility for youth events can't be verified automatically - there's "
+                               "no date-of-birth data. Manually omit players here after checking their age; "
+                               "they'll be dropped from both the leaderboard and their individual audit in "
+                               "the exported report.")
+                    omitted_names = st.multiselect(
+                        "Players to omit",
+                        options=[r["Player Name"] for r in rows]
+                    )
 
-            def color_status(val):
-                color = '#28a745' if val == "QUALIFIED" else '#dc3545'
-                return f'color: {color}; font-weight: bold;'
+            filtered_rows = rows
+            if hide_zero_war:
+                filtered_rows = [r for r in filtered_rows if r["WAR"] != 0]
+            if omitted_names:
+                filtered_rows = [r for r in filtered_rows if r["Player Name"] not in omitted_names]
 
-            st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
+            st.session_state.sorted_leaderboard_names = [r["Player Name"] for r in filtered_rows]
 
-            report_csv = generate_full_report_csv(rows, st.session_state.players_db, conf, conf['mode'])
-            st.download_button(
-                "Export Full Selection Report (CSV)",
-                data=report_csv.encode('utf-8'),
-                file_name=f"{conf['mode']}_selection_report.csv",
-                mime='text/csv'
-            )
+            if not filtered_rows:
+                st.info("No players remain after the selected filters.")
+            else:
+                df = pd.DataFrame(filtered_rows)
+                df.insert(0, "Rank", range(1, len(df) + 1))
+                df = df.rename(columns=threshold_headers(conf))
+                df.index = range(1, len(df) + 1)
+
+                def color_status(val):
+                    color = '#28a745' if val == "QUALIFIED" else '#dc3545'
+                    return f'color: {color}; font-weight: bold;'
+
+                st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
+
+                report_csv = generate_full_report_csv(filtered_rows, st.session_state.players_db, conf, conf['mode'])
+                st.download_button(
+                    "Export Full Selection Report (CSV)",
+                    data=report_csv.encode('utf-8'),
+                    file_name=f"{conf['mode']}_selection_report.csv",
+                    mime='text/csv'
+                )
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
