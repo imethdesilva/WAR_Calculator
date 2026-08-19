@@ -587,7 +587,7 @@ tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player
 with tabs[0]:
     if 'config' in st.session_state:
         if st.session_state.config.get('ignore_q5_push'):
-            st.warning("🔴 LIVE VIEW - Q5 push-back rule is disabled. Quadrimesters are anchored to "
+            st.warning("LIVE VIEW - Q5 push-back rule is disabled. Quadrimesters are anchored to "
                        "the cutoff date's natural season regardless of whether it has any tournaments "
                        "yet. Use this to monitor current-form WAR only; turn it off for the official "
                        "selection calculation.")
