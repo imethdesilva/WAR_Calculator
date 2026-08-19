@@ -69,12 +69,12 @@ class SelectionsEngine:
         """Returns the end date of the previous fixed season."""
         return start_date - relativedelta(days=1)
     
-    def calculate_configuration(self, mode, intl_date_str, tournament_dates=[]):
+    def calculate_configuration(self, mode, intl_date_str, tournament_dates=[], ignore_q5_push=False):
         try:
             intl_date = datetime.strptime(intl_date_str, "%d.%m.%Y")
             offset = 6 if mode == "WSC" else 3
             cutoff_date = intl_date - relativedelta(months=offset)
-            
+
             q5_start, q5_end = self.get_season_bounds(cutoff_date)
 
             tours_in_q5 = [d for d in tournament_dates if q5_start <= d <= cutoff_date]
@@ -84,7 +84,15 @@ class SelectionsEngine:
             # gets MERGED into the previous quadrimester (not dropped).
             merge_stray_tournament = is_first_month and len(tours_in_q5) == 1
 
-            if len(tours_in_q5) == 0 or merge_stray_tournament:
+            if ignore_q5_push:
+                # Live-view override: skip the p.3 "no tournament yet -> push back" and
+                # "stray tournament -> merge" rules entirely, and just anchor Q5 to the
+                # cutoff date's natural season. Lets an admin see today's live WAR as
+                # results trickle in, without the official-selection pushback logic
+                # making Q5 jump back a whole quadrimester while it's still empty.
+                merge_stray_tournament = False
+                actual_q5_end = q5_end
+            elif len(tours_in_q5) == 0 or merge_stray_tournament:
                 actual_q5_end = self.get_prev_season_end(q5_start)
             else:
                 actual_q5_end = q5_end
@@ -116,7 +124,8 @@ class SelectionsEngine:
                 "req_tours": 5 if mode == "WSC" else 3,
                 "req_recent": 2 if mode == "WSC" else 1,
                 "min_quads": 3,
-                "min_war": 800
+                "min_war": 800,
+                "ignore_q5_push": ignore_q5_push
             }
             
             return config, quads
@@ -417,6 +426,14 @@ with st.sidebar:
     st.title("Administrative Panel")
     selected_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"])
     event_date = st.text_input("International Event Date (DD.MM.YYYY)", value="15.10.2025")
+    ignore_q5_push = st.toggle(
+        "Ignore Q5 Push (Live View)",
+        value=False,
+        help="Official selection rules push Q5 back a full quadrimester when it's still empty "
+             "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
+             "quadrimester, so you can watch live WAR update as new results come in, ahead of "
+             "the official cutoff determination."
+    )
 
     if st.button("Initialize Selection Window"):
         # Reuse whatever tournament dates are already known (from a prior file
@@ -424,12 +441,16 @@ with st.sidebar:
         # and push Q5 back a full quadrimester when real data says otherwise.
         config, quads = st.session_state.engine.calculate_configuration(
             selected_mode, event_date,
-            tournament_dates=st.session_state.uploaded_tournament_dates
+            tournament_dates=st.session_state.uploaded_tournament_dates,
+            ignore_q5_push=ignore_q5_push
         )
         if config:
             st.session_state.config = config
             st.session_state.quad_ranges = quads
-            if not st.session_state.uploaded_tournament_dates:
+            if ignore_q5_push:
+                st.warning("Live View active: Q5 push-back rule is disabled. This is for monitoring "
+                           "current-form WAR only, not for official selection determinations.")
+            elif not st.session_state.uploaded_tournament_dates:
                 st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed empty per the PDF's "
                         "'no tournament held' rule until you upload and process real results.")
             st.success("Configuration Validated")
@@ -437,13 +458,13 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Data Ingestion")
     uploaded_files = st.file_uploader("Upload Tournament Files (.txt)", accept_multiple_files=True)
-    
+
     if uploaded_files:
         if st.button("Process Tournament Results"):
-          
+
             all_tour_dates = []
             parsed_tournament_objects = []
-            
+
             for f in uploaded_files:
                 content = f.read().decode('utf-8', errors='ignore')
                 data = st.session_state.engine.parse_tournament_file(content)
@@ -456,11 +477,12 @@ with st.sidebar:
                 st.stop()
 
             config, quads = st.session_state.engine.calculate_configuration(
-                selected_mode, 
-                event_date, 
-                tournament_dates=all_tour_dates
+                selected_mode,
+                event_date,
+                tournament_dates=all_tour_dates,
+                ignore_q5_push=ignore_q5_push
             )
-            
+
             if config:
                 st.session_state.config = config
                 st.session_state.quad_ranges = quads
@@ -557,6 +579,12 @@ tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player
 # Overview
 with tabs[0]:
     if 'config' in st.session_state:
+        if st.session_state.config.get('ignore_q5_push'):
+            st.warning("🔴 LIVE VIEW - Q5 push-back rule is disabled. Quadrimesters are anchored to "
+                       "the cutoff date's natural season regardless of whether it has any tournaments "
+                       "yet. Use this to monitor current-form WAR only; turn it off for the official "
+                       "selection calculation.")
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Tournament", st.session_state.config['mode'])
         c2.metric("Cutoff Date", st.session_state.config['cutoff_date'].strftime('%d %b %Y'))
