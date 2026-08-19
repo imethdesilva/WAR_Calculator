@@ -191,7 +191,6 @@ class SelectionsEngine:
         
         players_found = []
         current_section_games = 0
-        is_major_tournament = False 
 
         for line in lines:
             raw_line = line
@@ -201,8 +200,6 @@ class SelectionsEngine:
             game_header = re.search(r'(\d+)\s+games', line.lower())
             if game_header:
                 current_section_games = int(game_header.group(1))
-                if current_section_games >= 18:
-                    is_major_tournament = True
                 continue
 
             if re.match(r'^\d+\s+', line):
@@ -239,7 +236,6 @@ class SelectionsEngine:
         return {
             "name": t_name,
             "date": t_date,
-            "is_major": is_major_tournament,
             "players": players_found
         }
 
@@ -415,17 +411,27 @@ if 'engine' not in st.session_state:
     st.session_state.inactivity_map = {}
     st.session_state.processed_files = False
     st.session_state.sorted_leaderboard_names = []
+    st.session_state.uploaded_tournament_dates = []
 
 with st.sidebar:
     st.title("Administrative Panel")
     selected_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"])
     event_date = st.text_input("International Event Date (DD.MM.YYYY)", value="15.10.2025")
-    
+
     if st.button("Initialize Selection Window"):
-        config, quads = st.session_state.engine.calculate_configuration(selected_mode, event_date)
+        # Reuse whatever tournament dates are already known (from a prior file
+        # upload) so this preview doesn't wrongly assume "no tournaments yet"
+        # and push Q5 back a full quadrimester when real data says otherwise.
+        config, quads = st.session_state.engine.calculate_configuration(
+            selected_mode, event_date,
+            tournament_dates=st.session_state.uploaded_tournament_dates
+        )
         if config:
             st.session_state.config = config
             st.session_state.quad_ranges = quads
+            if not st.session_state.uploaded_tournament_dates:
+                st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed empty per the PDF's "
+                        "'no tournament held' rule until you upload and process real results.")
             st.success("Configuration Validated")
 
     st.markdown("---")
@@ -520,7 +526,10 @@ with st.sidebar:
                             db[name]["latest_rating_date"] = data['date']
                             db[name]["current_rating"] = p_file_data['new']
 
-                        if p_file_data['games'] >= 18 or data['is_major']:
+                        # PDF p.5: the candidate must have personally played the full 18
+                        # rounds - a file-wide "this tournament had an 18-round division
+                        # somewhere" flag is not enough if the player was in a shorter one.
+                        if p_file_data['games'] >= 18:
                             db[name]["major_count"] += 1
 
                         if q_info['quad'] >= 4:
@@ -534,6 +543,7 @@ with st.sidebar:
                 st.session_state.players_db = db
                 st.session_state.full_history_db = full_history
                 st.session_state.inactivity_map = inactivity_map
+                st.session_state.uploaded_tournament_dates = all_tour_dates
                 st.session_state.processed_files = True
                 st.success("Calculated WAR using Seasonal Calendar Weights")
                 st.rerun()
