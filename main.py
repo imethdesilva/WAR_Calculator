@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 import math
+import csv
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
@@ -335,22 +336,26 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf.write(f"International Event Date,{conf['intl_date'].strftime('%Y-%m-%d')}\n")
     buf.write(f"Min WAR,{conf['min_war']}\n\n")
 
+    writer = csv.writer(buf, lineterminator='\n')
+
     buf.write("SELECTION LEADERBOARD\n")
     lb_df = pd.DataFrame(rows_sorted)
     lb_df.insert(0, "Rank", range(1, len(lb_df) + 1))
     lb_df = lb_df.rename(columns=headers_map)
-    lb_df.to_csv(buf, index=False)
+    # lineterminator='\n' avoids pandas' default '\r\n' colliding with the plain '\n'
+    # used elsewhere in this buffer and producing malformed '\r\r\n' blank rows.
+    lb_df.to_csv(buf, index=False, lineterminator='\n')
     buf.write("\n\n")
 
     buf.write("INDIVIDUAL PLAYER BREAKDOWN\n\n")
     for row in rows_sorted:
         name = row["Player Name"]
-        buf.write(f"Player,{name}\n")
+        writer.writerow(["Player", name])
         data = players_db.get(name)
         if data:
             h_df = pd.DataFrame(data["history"])
             h_df = h_df.sort_values(by="Date")
-            h_df.to_csv(buf, index=False)
+            h_df.to_csv(buf, index=False, lineterminator='\n')
             war, war_precise = compute_war(data['history'])
             tw = sum(h['Weight'] for h in data['history'])
             twr = sum(h['WeightedVal'] for h in data['history'])
@@ -359,7 +364,9 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
         else:
             buf.write("No qualifying (non-provisional, in-window) tournament history found.\n")
         if row["Remarks"]:
-            buf.write(f"Remark,{row['Remarks']}\n")
+            # Remarks can contain commas, so this must go through csv.writer (not an
+            # f-string) or an unescaped comma would silently shift/break the row.
+            writer.writerow(["Remark", row["Remarks"]])
         buf.write("\n\n")
 
     return buf.getvalue()
