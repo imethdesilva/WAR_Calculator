@@ -618,7 +618,18 @@ with tabs[1]:
         )
 
         if rows:
-            hide_zero_war = st.checkbox("Hide players with WAR = 0", value=False)
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                hide_zero_war = st.checkbox("Hide players with WAR = 0", value=False)
+            with filter_col2:
+                hide_inactive = st.checkbox(
+                    "Hide inactive players (no tournaments in >1 year)",
+                    value=False,
+                    help="Excludes players flagged as 'Inactive' in the Remarks column - "
+                         "i.e. no tournaments played since more than a year before the cutoff "
+                         "date (PDF p.6). Does not exclude players who resumed after a past gap "
+                         "but haven't yet played 50 games since resumption."
+                )
 
             omitted_names = []
             if conf['mode'] == 'WYSC':
@@ -635,6 +646,11 @@ with tabs[1]:
             filtered_rows = rows
             if hide_zero_war:
                 filtered_rows = [r for r in filtered_rows if r["WAR"] != 0]
+            if hide_inactive:
+                filtered_rows = [
+                    r for r in filtered_rows
+                    if st.session_state.inactivity_map.get(r["Player Name"], {}).get("status") != "inactive"
+                ]
             if omitted_names:
                 filtered_rows = [r for r in filtered_rows if r["Player Name"] not in omitted_names]
 
