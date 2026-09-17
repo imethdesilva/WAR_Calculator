@@ -737,7 +737,7 @@ with tabs[1]:
         if rows:
             if st.session_state.upload_warnings:
                 total_warnings = sum(len(w) for w in st.session_state.upload_warnings.values())
-                with st.expander(f"⚠️ {total_warnings} line(s) across "
+                with st.expander(f"{total_warnings} line(s) across "
                                   f"{len(st.session_state.upload_warnings)} file(s) could not be parsed "
                                   f"during the last upload - review before trusting these results",
                                   expanded=False):
@@ -748,7 +748,7 @@ with tabs[1]:
 
             duplicate_pairs = find_similar_player_names([r["Player Name"] for r in rows])
             if duplicate_pairs:
-                with st.expander(f"⚠️ {len(duplicate_pairs)} possible duplicate player name pair(s) found - "
+                with st.expander(f"{len(duplicate_pairs)} possible duplicate player name pair(s) found - "
                                   f"a spelling mismatch silently splits one player's WAR across two rows",
                                   expanded=False):
                     dup_df = pd.DataFrame(duplicate_pairs, columns=["Name A", "Name B", "Match Type"])
@@ -817,7 +817,7 @@ with tabs[1]:
                         mime='text/csv'
                     )
                 with push_col:
-                    if st.button("🚀 Push WAR Updates to Web"):
+                    if st.button("Push WAR Updates to Web"):
                         push_filename = f"{conf['mode'].lower()}.csv"
                         try:
                             push_csv_to_pythonanywhere(report_csv, push_filename)
@@ -867,9 +867,9 @@ with tabs[2]:
             inact = st.session_state.inactivity_map.get(player_select, {})
             if inact.get("remark"):
                 if inact.get("override_ineligible"):
-                    st.error(f"⚠️ {inact['remark']}")
+                    st.error(inact['remark'])
                 else:
-                    st.info(f"ℹ️ {inact['remark']}")
+                    st.info(inact['remark'])
 
             # Individual Export
             indiv_buffer = io.StringIO()
@@ -936,7 +936,7 @@ with tabs[4]:
             st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
                        "tournaments within each year sorted latest-first.")
         with refresh_col:
-            if st.button("🔄 Refresh"):
+            if st.button("Refresh"):
                 st.rerun()
         with lock_col:
             if st.button("Lock"):
@@ -969,7 +969,7 @@ with tabs[4]:
                                 info_col2.metric("Date", data['date'].strftime('%Y-%m-%d'))
                                 info_col3.metric("Players", len({p['name'] for p in data['players']}))
                                 if data.get('warnings'):
-                                    with st.expander(f"⚠️ {len(data['warnings'])} line(s) in this file "
+                                    with st.expander(f"{len(data['warnings'])} line(s) in this file "
                                                       f"could not be parsed"):
                                         for w in data['warnings']:
                                             st.caption(w)
@@ -987,7 +987,7 @@ with tabs[4]:
                             if has_unsaved_edits:
                                 edited_data = st.session_state.engine.parse_tournament_file(edited_text)
                                 if edited_data is None:
-                                    st.error("⚠️ Parse preview: this edit no longer has a readable date in "
+                                    st.error("Parse preview: this edit no longer has a readable date in "
                                               "the first 5 lines - saving it would make the file unusable "
                                               "by the calculator.")
                                 else:
@@ -995,11 +995,11 @@ with tabs[4]:
                                     new_players = len({p['name'] for p in edited_data['players']})
                                     new_warns = len(edited_data.get('warnings') or [])
                                     if new_players < orig_players or new_warns:
-                                        st.warning(f"⚠️ Parse preview of your edit: {new_players} player(s) "
+                                        st.warning(f"Parse preview of your edit: {new_players} player(s) "
                                                     f"detected (was {orig_players}), {new_warns} line(s) "
                                                     f"unparseable. Review before saving/pushing.")
                                     else:
-                                        st.caption(f"✓ Parse preview of your edit: {new_players} player(s) "
+                                        st.caption(f"Parse preview of your edit: {new_players} player(s) "
                                                     f"detected - looks OK.")
 
                             confirm_key = f"archive_push_confirm_{year}_{fname}"
@@ -1015,7 +1015,7 @@ with tabs[4]:
                                     except OSError as e:
                                         st.error(f"Could not save {fname}: {e}")
                             with action_col2:
-                                if st.button("📤 Push Changes to GitHub", key=f"archive_push_{year}_{fname}"):
+                                if st.button("Push Changes to GitHub", key=f"archive_push_{year}_{fname}"):
                                     st.session_state[confirm_key] = True
                                     st.rerun()
                             with action_col3:
@@ -1028,7 +1028,7 @@ with tabs[4]:
                                 )
 
                             if st.session_state.get(confirm_key):
-                                st.warning("⚠️ This pushes directly to the public GitHub repo (origin/main) "
+                                st.warning("This pushes directly to the public GitHub repo (origin/main) "
                                            "with no review step. Confirm you want to publish this edit.")
                                 diff_lines = list(difflib.unified_diff(
                                     content.splitlines(), edited_text.splitlines(),
@@ -1041,7 +1041,7 @@ with tabs[4]:
 
                                 confirm_col, cancel_col = st.columns(2)
                                 with confirm_col:
-                                    if st.button("✅ Confirm & Push", key=f"archive_push_confirm_btn_{year}_{fname}"):
+                                    if st.button("Confirm & Push", key=f"archive_push_confirm_btn_{year}_{fname}"):
                                         try:
                                             with open(fpath, "w", encoding="utf-8") as f:
                                                 f.write(edited_text)
