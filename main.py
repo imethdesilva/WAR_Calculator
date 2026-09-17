@@ -7,49 +7,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
 import io
-import google.generativeai as genai
-import PyPDF2
-
-genai.configure(api_key=st.secrets["GEMINI_KEY"])
-model = genai.GenerativeModel('gemini-2.5-flash')
-
-def load_pdf_text(filename):
-    if not os.path.exists(filename):
-        return ""
-    try:
-        text = ""
-        with open(filename, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
-                content = page.extract_text()
-                if content:
-                    text += content + "\n"
-        return text
-    except Exception as e:
-        return f"Error reading PDF: {e}"
-
-SYSTEM_INSTRUCTION = """
-# IDENTITY
-You are MUUMUUS, the intelligent AI Consultant for the Scrabble Federation of Sri Lanka. 
-
-# BEHAVIOR GUIDELINES
-- DO NOT introduce yourself or state your name in every response. Only state your name if the user specifically asks who you are or at the very beginning of a new session.
-- Maintain a natural, fluid conversation. Refer back to previous things the user said when appropriate (e.g., "As we discussed earlier regarding your game count...").
-- Be professional, warm, and helpful. You are a consultant, not a robot.
-
-# CITATION PROTOCOL
-- You must always cite the official selection criteria PDF. Example: "According to Page 6, Section 2..."
-- Use the provided context to answer questions accurately.
-
-# CORE RULES
-- WAR window: 20 months.
-- Quads: Jan-Apr, May-Aug, Sep-Dec.
-- WSC: 80 games / 5 tours.
-- WYSC: 50 games / 3 tours.
-- Tie-break: 1st Current Rating, 2nd WAR (2 decimals).
-"""
-
-PDF_CONTENT = load_pdf_text("Selections Criteria 2024.pdf")
+import requests
 
 class SelectionsEngine:
     def __init__(self):
@@ -441,6 +399,29 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     return buf.getvalue()
 
 
+PYTHONANYWHERE_STATIC_CSV_PATH = "/mysite/static/csv"
+
+
+def push_csv_to_pythonanywhere(csv_text, filename):
+    """Uploads csv_text to <PYTHONANYWHERE_STATIC_CSV_PATH>/<filename> in the user's
+    PythonAnywhere account via the Files API, overwriting whatever is already
+    published there. Requires PYTHONANYWHERE_USERNAME and PYTHONANYWHERE_API_TOKEN
+    in st.secrets (Account > API Token on PythonAnywhere)."""
+    username = st.secrets["PYTHONANYWHERE_USERNAME"]
+    token = st.secrets["PYTHONANYWHERE_API_TOKEN"]
+
+    dest_path = f"/home/{username}{PYTHONANYWHERE_STATIC_CSV_PATH}/{filename}"
+    url = f"https://www.pythonanywhere.com/api/v0/user/{username}/files/path{dest_path}"
+
+    response = requests.post(
+        url,
+        headers={"Authorization": f"Token {token}"},
+        files={"content": (filename, csv_text.encode('utf-8'), "text/csv")},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
 # UI
 st.set_page_config(page_title="National Selections Dashboard", layout="wide")
 
@@ -652,7 +633,7 @@ st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
 tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria",
-                "AI Assistant", "Tournament Archive", "Tournament History"])
+                "Tournament Archive", "Tournament History"])
 
 # Overview
 with tabs[0]:
@@ -742,12 +723,27 @@ with tabs[1]:
                 st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True)
 
                 report_csv = generate_full_report_csv(filtered_rows, st.session_state.players_db, conf, conf['mode'])
-                st.download_button(
-                    "Export Full Selection Report (CSV)",
-                    data=report_csv.encode('utf-8'),
-                    file_name=f"{conf['mode']}_selection_report.csv",
-                    mime='text/csv'
-                )
+
+                export_col, push_col = st.columns(2)
+                with export_col:
+                    st.download_button(
+                        "Export Full Selection Report (CSV)",
+                        data=report_csv.encode('utf-8'),
+                        file_name=f"{conf['mode']}_selection_report.csv",
+                        mime='text/csv'
+                    )
+                with push_col:
+                    if st.button("🚀 Push WAR Updates to Web"):
+                        push_filename = f"{conf['mode'].lower()}.csv"
+                        try:
+                            push_csv_to_pythonanywhere(report_csv, push_filename)
+                            st.success(f"Pushed {push_filename} live to the PythonAnywhere site.")
+                        except KeyError:
+                            st.error("Missing PYTHONANYWHERE_USERNAME / PYTHONANYWHERE_API_TOKEN in "
+                                      ".streamlit/secrets.toml - add them (Account > API Token on "
+                                      "PythonAnywhere) and restart the app.")
+                        except requests.exceptions.RequestException as e:
+                            st.error(f"Upload failed: {e}")
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
@@ -835,81 +831,8 @@ with tabs[3]:
     st.link_button("Read Technical Documentation on Medium", "https://medium.com/@imethdesilva/technical-documentation-nss-war-calculator-4c7641c9875d")
     st.link_button("Read about the National Scrabble Selections Process on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
 
-with tabs[4]:
-    st.header("AI Selection Assistant")
-
-    if PDF_CONTENT:
-        st.success(" MUUMUUS is online and has read the Selection Criteria.")
-    else:
-        st.warning("MUUMUUS is online but the Criteria PDF was not found.")
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.chat_input("Ask MUUMUUS about WSC/WYSC rules..."):
-        st.chat_message("user").markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        context_for_ai = f"""
-        {SYSTEM_INSTRUCTION}
-        
-        REFERENCE DOCUMENT CONTENT:
-        {PDF_CONTENT}
-        
-        CONVERSATION HISTORY:
-        """
-        for msg in st.session_state.messages[-6:]:
-            role_name = "Player" if msg["role"] == "user" else "MUUMUUS"
-            context_for_ai += f"{role_name}: {msg['content']}\n"
-
-        context_for_ai += f"\nMUUMUUS, please respond to the player's latest request while citing the PDF accurately."
-
-        try:
-           
-            response = model.generate_content(context_for_ai)
-            answer = response.text
-            
-            with st.chat_message("assistant"):
-                st.markdown(answer)
-            
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            
-        except Exception as e:
-            st.error(f"MUUMUUS encountered an error: {e}")
-            st.info("Check the Developer Panel below to verify your API Key and Model status.")
-
-    st.markdown("---")
-    with st.expander("🛠️ Developer Panel"):
-        st.write("Use these tools to manage the AI session.")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("List Available Models"):
-                try:
-                    available_models = []
-                    for m in genai.list_models():
-                        if 'generateContent' in m.supported_generation_methods:
-                            available_models.append(m.name)
-                    st.json(available_models)
-                    
-                    current_model_name = "models/gemini-1.5-flash-latest"
-                    if any(current_model_name in m for m in available_models):
-                        st.success(f"Confirmed: {current_model_name} is active.")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-        
-        with col2:
-            if st.button("Clear History & Reset MUUMUUS"):
-                st.session_state.messages = []
-                st.rerun()
-
 # Tournament Archive
-with tabs[5]:
+with tabs[4]:
     st.header("Tournament File Archive")
 
     if not st.session_state.archive_unlocked:
@@ -985,7 +908,7 @@ with tabs[5]:
                                 )
 
 # Tournament History
-with tabs[6]:
+with tabs[5]:
     st.header("Tournament History")
     st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', latest first.")
 
