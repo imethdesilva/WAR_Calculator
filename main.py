@@ -331,33 +331,49 @@ TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = "poopoopeepee"
 
 
-def get_archive_structure(base_dir=TOURNAMENT_ARCHIVE_DIR):
-    """Returns {year_folder_name: [txt filenames sorted]} for whatever year subfolders
-    exist under base_dir. This folder holds real tournament results and is
-    intentionally kept out of git (.gitignore) - it's a local-only archive, so this
-    returns empty on a checkout that doesn't have it."""
-    structure = {}
+def _read_archive_file(fpath):
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def get_archive_structure(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Returns an ordered list of (year, [filenames]) tuples for whatever year
+    subfolders exist under base_dir - years newest-first, and files within each year
+    sorted by their parsed tournament date, latest first (undated files sort last,
+    alphabetically). This folder holds real tournament results; on a checkout that
+    doesn't have it, this returns an empty list."""
+    structure = []
     if not os.path.isdir(base_dir):
         return structure
-    for entry in sorted(os.listdir(base_dir)):
-        year_path = os.path.join(base_dir, entry)
-        if os.path.isdir(year_path):
-            files = sorted(f for f in os.listdir(year_path) if f.lower().endswith(".txt"))
-            structure[entry] = files
+
+    year_dirs = [e for e in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, e))]
+    for year in sorted(year_dirs, reverse=True):
+        year_path = os.path.join(base_dir, year)
+        dated_files = []
+        for fname in os.listdir(year_path):
+            if not fname.lower().endswith(".txt"):
+                continue
+            content = _read_archive_file(os.path.join(year_path, fname))
+            data = engine.parse_tournament_file(content) if content is not None else None
+            dated_files.append((fname, data['date'] if data else None))
+
+        dated_files.sort(key=lambda fd: (fd[1] is None, -fd[1].toordinal() if fd[1] else 0, fd[0]))
+        structure.append((year, [fname for fname, _ in dated_files]))
+
     return structure
 
 
 def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
     """Parses every file in the archive and returns one summary row per tournament,
-    sorted chronologically by the date embedded in the file itself."""
+    sorted with the latest tournament first (so later years/dates appear first)."""
     rows = []
-    for year, files in get_archive_structure(base_dir).items():
+    for year, files in get_archive_structure(engine, base_dir):
         for fname in files:
-            fpath = os.path.join(base_dir, year, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-            except OSError:
+            content = _read_archive_file(os.path.join(base_dir, year, fname))
+            if content is None:
                 continue
 
             data = engine.parse_tournament_file(content)
@@ -376,7 +392,7 @@ def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
                 "Source File": fname,
             })
 
-    rows.sort(key=lambda r: r["Date"])
+    rows.sort(key=lambda r: r["Date"], reverse=True)
     return rows
 
 
@@ -908,31 +924,29 @@ with tabs[5]:
     else:
         top_col, lock_col = st.columns([5, 1])
         with top_col:
-            st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - a local-only folder, not part of the git repository.")
+            st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
+                       "tournaments within each year sorted latest-first.")
         with lock_col:
             if st.button("Lock"):
                 st.session_state.archive_unlocked = False
                 st.rerun()
 
-        structure = get_archive_structure()
+        structure = get_archive_structure(st.session_state.engine)
         if not structure:
             st.warning(f"No archive found. Expected year subfolders (e.g. '2024', '2025') under "
                        f"'{TOURNAMENT_ARCHIVE_DIR}/' next to main.py.")
         else:
-            year_tabs = st.tabs(list(structure.keys()))
-            for year_tab, year in zip(year_tabs, structure.keys()):
+            year_tabs = st.tabs([year for year, _ in structure])
+            for year_tab, (year, files) in zip(year_tabs, structure):
                 with year_tab:
-                    files = structure[year]
                     if not files:
                         st.caption("No files in this folder.")
                         continue
                     for fname in files:
                         fpath = os.path.join(TOURNAMENT_ARCHIVE_DIR, year, fname)
-                        try:
-                            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read()
-                        except OSError as e:
-                            st.error(f"Could not read {fname}: {e}")
+                        content = _read_archive_file(fpath)
+                        if content is None:
+                            st.error(f"Could not read {fname}.")
                             continue
 
                         data = st.session_state.engine.parse_tournament_file(content)
@@ -945,19 +959,35 @@ with tabs[5]:
                             else:
                                 st.caption("Could not parse tournament metadata from this file.")
 
-                            st.text_area("File Contents", content, height=200, key=f"archive_view_{year}_{fname}")
-                            st.download_button(
-                                "Download",
-                                data=content.encode('utf-8'),
-                                file_name=fname,
-                                mime='text/plain',
-                                key=f"archive_dl_{year}_{fname}"
+                            text_key = f"archive_view_{year}_{fname}"
+                            st.text_area(
+                                "File Contents (edit player names or any other text directly, then Save)",
+                                content, height=200, key=text_key
                             )
+
+                            action_col1, action_col2 = st.columns(2)
+                            with action_col1:
+                                if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
+                                    try:
+                                        with open(fpath, "w", encoding="utf-8") as f:
+                                            f.write(st.session_state[text_key])
+                                        st.success(f"Saved changes to {fname}.")
+                                        st.rerun()
+                                    except OSError as e:
+                                        st.error(f"Could not save {fname}: {e}")
+                            with action_col2:
+                                st.download_button(
+                                    "Download",
+                                    data=content.encode('utf-8'),
+                                    file_name=fname,
+                                    mime='text/plain',
+                                    key=f"archive_dl_{year}_{fname}"
+                                )
 
 # Tournament History
 with tabs[6]:
     st.header("Tournament History")
-    st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', sorted chronologically.")
+    st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', latest first.")
 
     history_rows = build_tournament_history(st.session_state.engine)
     if not history_rows:
@@ -967,4 +997,5 @@ with tabs[6]:
         hist_df['Date'] = hist_df['Date'].dt.strftime('%Y-%m-%d')
         hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
         st.dataframe(hist_df, use_container_width=True, hide_index=True)
-        st.caption(f"{len(history_rows)} tournaments found across {len(get_archive_structure())} year folder(s).")
+        year_count = len(get_archive_structure(st.session_state.engine))
+        st.caption(f"{len(history_rows)} tournaments found across {year_count} year folder(s).")
