@@ -327,6 +327,59 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
     return rows
 
 
+TOURNAMENT_ARCHIVE_DIR = "tournament files"
+ARCHIVE_PASSWORD = "poopoopeepee"
+
+
+def get_archive_structure(base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Returns {year_folder_name: [txt filenames sorted]} for whatever year subfolders
+    exist under base_dir. This folder holds real tournament results and is
+    intentionally kept out of git (.gitignore) - it's a local-only archive, so this
+    returns empty on a checkout that doesn't have it."""
+    structure = {}
+    if not os.path.isdir(base_dir):
+        return structure
+    for entry in sorted(os.listdir(base_dir)):
+        year_path = os.path.join(base_dir, entry)
+        if os.path.isdir(year_path):
+            files = sorted(f for f in os.listdir(year_path) if f.lower().endswith(".txt"))
+            structure[entry] = files
+    return structure
+
+
+def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Parses every file in the archive and returns one summary row per tournament,
+    sorted chronologically by the date embedded in the file itself."""
+    rows = []
+    for year, files in get_archive_structure(base_dir).items():
+        for fname in files:
+            fpath = os.path.join(base_dir, year, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except OSError:
+                continue
+
+            data = engine.parse_tournament_file(content)
+            if not data:
+                continue
+
+            distinct_players = {p['name'] for p in data['players']}
+            game_counts = sorted({p['games'] for p in data['players']})
+
+            rows.append({
+                "Date": data['date'],
+                "Tournament Name": data['name'],
+                "Year Folder": year,
+                "Players": len(distinct_players),
+                "Division Sizes (games)": ", ".join(str(g) for g in game_counts) if game_counts else "-",
+                "Source File": fname,
+            })
+
+    rows.sort(key=lambda r: r["Date"])
+    return rows
+
+
 def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf = io.StringIO()
     headers_map = threshold_headers(conf)
@@ -428,6 +481,7 @@ if 'engine' not in st.session_state:
     st.session_state.processed_files = False
     st.session_state.sorted_leaderboard_names = []
     st.session_state.uploaded_tournament_dates = []
+    st.session_state.archive_unlocked = False
 
 with st.sidebar:
     st.title("Administrative Panel")
@@ -581,7 +635,8 @@ with st.sidebar:
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
-tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria", "AI Assistant"])
+tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria",
+                "AI Assistant", "Tournament Archive", "Tournament History"])
 
 # Overview
 with tabs[0]:
@@ -836,3 +891,80 @@ with tabs[4]:
             if st.button("Clear History & Reset MUUMUUS"):
                 st.session_state.messages = []
                 st.rerun()
+
+# Tournament Archive
+with tabs[5]:
+    st.header("Tournament File Archive")
+
+    if not st.session_state.archive_unlocked:
+        st.info("This section is password protected. Enter the password to browse the archived tournament files.")
+        archive_pwd = st.text_input("Password", type="password", key="archive_pwd_input")
+        if st.button("Unlock Archive"):
+            if archive_pwd == ARCHIVE_PASSWORD:
+                st.session_state.archive_unlocked = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    else:
+        top_col, lock_col = st.columns([5, 1])
+        with top_col:
+            st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - a local-only folder, not part of the git repository.")
+        with lock_col:
+            if st.button("Lock"):
+                st.session_state.archive_unlocked = False
+                st.rerun()
+
+        structure = get_archive_structure()
+        if not structure:
+            st.warning(f"No archive found. Expected year subfolders (e.g. '2024', '2025') under "
+                       f"'{TOURNAMENT_ARCHIVE_DIR}/' next to main.py.")
+        else:
+            year_tabs = st.tabs(list(structure.keys()))
+            for year_tab, year in zip(year_tabs, structure.keys()):
+                with year_tab:
+                    files = structure[year]
+                    if not files:
+                        st.caption("No files in this folder.")
+                        continue
+                    for fname in files:
+                        fpath = os.path.join(TOURNAMENT_ARCHIVE_DIR, year, fname)
+                        try:
+                            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                        except OSError as e:
+                            st.error(f"Could not read {fname}: {e}")
+                            continue
+
+                        data = st.session_state.engine.parse_tournament_file(content)
+                        with st.expander(fname):
+                            if data:
+                                info_col1, info_col2, info_col3 = st.columns(3)
+                                info_col1.metric("Tournament", data['name'] or "Unknown")
+                                info_col2.metric("Date", data['date'].strftime('%Y-%m-%d'))
+                                info_col3.metric("Players", len({p['name'] for p in data['players']}))
+                            else:
+                                st.caption("Could not parse tournament metadata from this file.")
+
+                            st.text_area("File Contents", content, height=200, key=f"archive_view_{year}_{fname}")
+                            st.download_button(
+                                "Download",
+                                data=content.encode('utf-8'),
+                                file_name=fname,
+                                mime='text/plain',
+                                key=f"archive_dl_{year}_{fname}"
+                            )
+
+# Tournament History
+with tabs[6]:
+    st.header("Tournament History")
+    st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', sorted chronologically.")
+
+    history_rows = build_tournament_history(st.session_state.engine)
+    if not history_rows:
+        st.warning(f"No tournament files found under '{TOURNAMENT_ARCHIVE_DIR}/'.")
+    else:
+        hist_df = pd.DataFrame(history_rows)
+        hist_df['Date'] = hist_df['Date'].dt.strftime('%Y-%m-%d')
+        hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+        st.caption(f"{len(history_rows)} tournaments found across {len(get_archive_structure())} year folder(s).")
