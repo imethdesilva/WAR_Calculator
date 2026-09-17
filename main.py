@@ -8,6 +8,7 @@ from dateutil.relativedelta import relativedelta
 import os
 import io
 import subprocess
+import difflib
 import requests
 
 class SelectionsEngine:
@@ -157,11 +158,12 @@ class SelectionsEngine:
                 break
         
         if not t_date: return None
-        
+
         players_found = []
+        warnings = []
         current_section_games = 0
 
-        for line in lines:
+        for line_no, line in enumerate(lines, start=1):
             raw_line = line
             line = line.strip()
             if not line: continue
@@ -173,8 +175,11 @@ class SelectionsEngine:
 
             if re.match(r'^\d+\s+', line):
                 numeric_blocks = re.findall(r'\(?\s*[\d\-+.]+\s*\)?', line)
-                if len(numeric_blocks) < 2: continue 
-                
+                if len(numeric_blocks) < 2:
+                    warnings.append(f"Line {line_no}: looked like a player row but only found "
+                                     f"{len(numeric_blocks)} numeric field(s) - skipped: \"{line}\"")
+                    continue
+
                 try:
                     # A rating shown in parentheses, e.g. "( 900)", is the standard notation
                     # for a provisional (not-yet-fully-rated) result. PDF p.2 excludes these
@@ -200,12 +205,18 @@ class SelectionsEngine:
                             "games": current_section_games,
                             "provisional": is_provisional
                         })
-                except: continue
+                    else:
+                        warnings.append(f"Line {line_no}: parsed ratings but no player name remained "
+                                         f"- skipped: \"{line}\"")
+                except Exception as e:
+                    warnings.append(f"Line {line_no}: could not parse ({e}) - skipped: \"{line}\"")
+                    continue
 
         return {
             "name": t_name,
             "date": t_date,
-            "players": players_found
+            "players": players_found,
+            "warnings": warnings
         }
 
 
@@ -286,8 +297,30 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
     return rows
 
 
+def find_similar_player_names(names, ratio_threshold=0.85):
+    """Flags likely-duplicate player names so an admin can catch a typo or inconsistent
+    spelling before it silently fragments one person's results across two 'players' -
+    each with their own (wrong) WAR. Names identical except for case/spacing are flagged
+    as an exact match; anything else above ratio_threshold is flagged as similar spelling
+    for manual review. Returns a list of (name_a, name_b, kind) tuples."""
+    distinct_names = sorted(set(names))
+    normalized = {n: re.sub(r'\s+', ' ', n).strip().lower() for n in distinct_names}
+
+    pairs = []
+    for i in range(len(distinct_names)):
+        for j in range(i + 1, len(distinct_names)):
+            a, b = distinct_names[i], distinct_names[j]
+            if normalized[a] == normalized[b]:
+                pairs.append((a, b, "Exact match (case/spacing only)"))
+            else:
+                ratio = difflib.SequenceMatcher(None, normalized[a], normalized[b]).ratio()
+                if ratio >= ratio_threshold:
+                    pairs.append((a, b, "Similar spelling"))
+    return pairs
+
+
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
-ARCHIVE_PASSWORD = "poopoopeepee"
+ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
 
 
 def _read_archive_file(fpath):
@@ -505,6 +538,7 @@ if 'engine' not in st.session_state:
     st.session_state.processed_files = False
     st.session_state.sorted_leaderboard_names = []
     st.session_state.uploaded_tournament_dates = []
+    st.session_state.upload_warnings = {}
     st.session_state.archive_unlocked = False
 
 with st.sidebar:
@@ -549,6 +583,7 @@ with st.sidebar:
 
             all_tour_dates = []
             parsed_tournament_objects = []
+            upload_warnings = {}
 
             for f in uploaded_files:
                 content = f.read().decode('utf-8', errors='ignore')
@@ -556,6 +591,8 @@ with st.sidebar:
                 if data:
                     all_tour_dates.append(data['date'])
                     parsed_tournament_objects.append(data)
+                    if data.get('warnings'):
+                        upload_warnings[f.name] = data['warnings']
 
             if not all_tour_dates:
                 st.error("No valid tournament data found in uploaded files.")
@@ -651,6 +688,7 @@ with st.sidebar:
                 st.session_state.full_history_db = full_history
                 st.session_state.inactivity_map = inactivity_map
                 st.session_state.uploaded_tournament_dates = all_tour_dates
+                st.session_state.upload_warnings = upload_warnings
                 st.session_state.processed_files = True
                 st.success("Calculated WAR using Seasonal Calendar Weights")
                 st.rerun()
@@ -697,6 +735,25 @@ with tabs[1]:
         )
 
         if rows:
+            if st.session_state.upload_warnings:
+                total_warnings = sum(len(w) for w in st.session_state.upload_warnings.values())
+                with st.expander(f"⚠️ {total_warnings} line(s) across "
+                                  f"{len(st.session_state.upload_warnings)} file(s) could not be parsed "
+                                  f"during the last upload - review before trusting these results",
+                                  expanded=False):
+                    for fname, warns in st.session_state.upload_warnings.items():
+                        st.markdown(f"**{fname}**")
+                        for w in warns:
+                            st.caption(w)
+
+            duplicate_pairs = find_similar_player_names([r["Player Name"] for r in rows])
+            if duplicate_pairs:
+                with st.expander(f"⚠️ {len(duplicate_pairs)} possible duplicate player name pair(s) found - "
+                                  f"a spelling mismatch silently splits one player's WAR across two rows",
+                                  expanded=False):
+                    dup_df = pd.DataFrame(duplicate_pairs, columns=["Name A", "Name B", "Match Type"])
+                    st.dataframe(dup_df, use_container_width=True, hide_index=True)
+
             filter_col1, filter_col2 = st.columns(2)
             with filter_col1:
                 hide_zero_war = st.checkbox("Hide players with WAR = 0", value=False)
@@ -862,7 +919,9 @@ with tabs[3]:
 with tabs[4]:
     st.header("Tournament File Archive")
 
-    if not st.session_state.archive_unlocked:
+    if not ARCHIVE_PASSWORD:
+        st.error("ARCHIVE_PASSWORD is not set in .streamlit/secrets.toml - add it to enable this section.")
+    elif not st.session_state.archive_unlocked:
         st.info("This section is password protected. Enter the password to browse the archived tournament files.")
         archive_pwd = st.text_input("Password", type="password", key="archive_pwd_input")
         if st.button("Unlock Archive"):
@@ -909,6 +968,11 @@ with tabs[4]:
                                 info_col1.metric("Tournament", data['name'] or "Unknown")
                                 info_col2.metric("Date", data['date'].strftime('%Y-%m-%d'))
                                 info_col3.metric("Players", len({p['name'] for p in data['players']}))
+                                if data.get('warnings'):
+                                    with st.expander(f"⚠️ {len(data['warnings'])} line(s) in this file "
+                                                      f"could not be parsed"):
+                                        for w in data['warnings']:
+                                            st.caption(w)
                             else:
                                 st.caption("Could not parse tournament metadata from this file.")
 
@@ -918,31 +982,42 @@ with tabs[4]:
                                 content, height=200, key=text_key
                             )
 
+                            edited_text = st.session_state[text_key]
+                            has_unsaved_edits = edited_text != content
+                            if has_unsaved_edits:
+                                edited_data = st.session_state.engine.parse_tournament_file(edited_text)
+                                if edited_data is None:
+                                    st.error("⚠️ Parse preview: this edit no longer has a readable date in "
+                                              "the first 5 lines - saving it would make the file unusable "
+                                              "by the calculator.")
+                                else:
+                                    orig_players = len({p['name'] for p in data['players']}) if data else 0
+                                    new_players = len({p['name'] for p in edited_data['players']})
+                                    new_warns = len(edited_data.get('warnings') or [])
+                                    if new_players < orig_players or new_warns:
+                                        st.warning(f"⚠️ Parse preview of your edit: {new_players} player(s) "
+                                                    f"detected (was {orig_players}), {new_warns} line(s) "
+                                                    f"unparseable. Review before saving/pushing.")
+                                    else:
+                                        st.caption(f"✓ Parse preview of your edit: {new_players} player(s) "
+                                                    f"detected - looks OK.")
+
+                            confirm_key = f"archive_push_confirm_{year}_{fname}"
+
                             action_col1, action_col2, action_col3 = st.columns(3)
                             with action_col1:
                                 if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
                                     try:
                                         with open(fpath, "w", encoding="utf-8") as f:
-                                            f.write(st.session_state[text_key])
+                                            f.write(edited_text)
                                         st.success(f"Saved changes to {fname} on this machine.")
                                         st.rerun()
                                     except OSError as e:
                                         st.error(f"Could not save {fname}: {e}")
                             with action_col2:
                                 if st.button("📤 Push Changes to GitHub", key=f"archive_push_{year}_{fname}"):
-                                    try:
-                                        with open(fpath, "w", encoding="utf-8") as f:
-                                            f.write(st.session_state[text_key])
-                                        pushed = push_archive_file_to_github(
-                                            fpath, f"Edit {fname} ({year}) via WAR Calculator dashboard"
-                                        )
-                                        if pushed:
-                                            st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
-                                        else:
-                                            st.info(f"{fname} already matches what's on GitHub - nothing to push.")
-                                        st.rerun()
-                                    except (OSError, RuntimeError) as e:
-                                        st.error(f"Could not push {fname} to GitHub: {e}")
+                                    st.session_state[confirm_key] = True
+                                    st.rerun()
                             with action_col3:
                                 st.download_button(
                                     "Download",
@@ -951,6 +1026,41 @@ with tabs[4]:
                                     mime='text/plain',
                                     key=f"archive_dl_{year}_{fname}"
                                 )
+
+                            if st.session_state.get(confirm_key):
+                                st.warning("⚠️ This pushes directly to the public GitHub repo (origin/main) "
+                                           "with no review step. Confirm you want to publish this edit.")
+                                diff_lines = list(difflib.unified_diff(
+                                    content.splitlines(), edited_text.splitlines(),
+                                    fromfile="on disk", tofile="your edit", lineterm=""
+                                ))
+                                if diff_lines:
+                                    st.code("\n".join(diff_lines), language="diff")
+                                else:
+                                    st.caption("No textual changes detected - this will push the file as-is.")
+
+                                confirm_col, cancel_col = st.columns(2)
+                                with confirm_col:
+                                    if st.button("✅ Confirm & Push", key=f"archive_push_confirm_btn_{year}_{fname}"):
+                                        try:
+                                            with open(fpath, "w", encoding="utf-8") as f:
+                                                f.write(edited_text)
+                                            pushed = push_archive_file_to_github(
+                                                fpath, f"Edit {fname} ({year}) via WAR Calculator dashboard"
+                                            )
+                                            st.session_state[confirm_key] = False
+                                            if pushed:
+                                                st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
+                                            else:
+                                                st.info(f"{fname} already matches what's on GitHub - "
+                                                        f"nothing to push.")
+                                            st.rerun()
+                                        except (OSError, RuntimeError) as e:
+                                            st.error(f"Could not push {fname} to GitHub: {e}")
+                                with cancel_col:
+                                    if st.button("Cancel", key=f"archive_push_cancel_{year}_{fname}"):
+                                        st.session_state[confirm_key] = False
+                                        st.rerun()
 
 # Tournament History
 with tabs[5]:
