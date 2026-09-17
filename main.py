@@ -7,6 +7,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
 import io
+import subprocess
 import requests
 
 class SelectionsEngine:
@@ -295,6 +296,32 @@ def _read_archive_file(fpath):
             return f.read()
     except OSError:
         return None
+
+
+def push_archive_file_to_github(fpath, commit_message):
+    """Commits and pushes fpath's current on-disk content straight to origin/main,
+    using the git checkout this app is already running from. Scopes 'git commit' to
+    just this path (via pathspec) so it never sweeps up unrelated uncommitted work
+    sitting elsewhere in the repo. Returns False if the file already matches what's
+    on GitHub (nothing to commit), True if a new commit was pushed."""
+    def run(args):
+        return subprocess.run(args, capture_output=True, text=True)
+
+    add = run(["git", "add", "--", fpath])
+    if add.returncode != 0:
+        raise RuntimeError(add.stderr or add.stdout)
+
+    commit = run(["git", "commit", "-m", commit_message, "--", fpath])
+    if commit.returncode != 0:
+        if "nothing to commit" in (commit.stdout + commit.stderr).lower():
+            return False
+        raise RuntimeError(commit.stdout + commit.stderr)
+
+    push = run(["git", "push", "origin", "main"])
+    if push.returncode != 0:
+        raise RuntimeError(push.stdout + push.stderr)
+
+    return True
 
 
 def get_archive_structure(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
@@ -845,10 +872,13 @@ with tabs[4]:
             else:
                 st.error("Incorrect password.")
     else:
-        top_col, lock_col = st.columns([5, 1])
+        top_col, refresh_col, lock_col = st.columns([4, 1, 1])
         with top_col:
             st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
                        "tournaments within each year sorted latest-first.")
+        with refresh_col:
+            if st.button("🔄 Refresh"):
+                st.rerun()
         with lock_col:
             if st.button("Lock"):
                 st.session_state.archive_unlocked = False
@@ -888,17 +918,32 @@ with tabs[4]:
                                 content, height=200, key=text_key
                             )
 
-                            action_col1, action_col2 = st.columns(2)
+                            action_col1, action_col2, action_col3 = st.columns(3)
                             with action_col1:
                                 if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
                                     try:
                                         with open(fpath, "w", encoding="utf-8") as f:
                                             f.write(st.session_state[text_key])
-                                        st.success(f"Saved changes to {fname}.")
+                                        st.success(f"Saved changes to {fname} on this machine.")
                                         st.rerun()
                                     except OSError as e:
                                         st.error(f"Could not save {fname}: {e}")
                             with action_col2:
+                                if st.button("📤 Push Changes to GitHub", key=f"archive_push_{year}_{fname}"):
+                                    try:
+                                        with open(fpath, "w", encoding="utf-8") as f:
+                                            f.write(st.session_state[text_key])
+                                        pushed = push_archive_file_to_github(
+                                            fpath, f"Edit {fname} ({year}) via WAR Calculator dashboard"
+                                        )
+                                        if pushed:
+                                            st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
+                                        else:
+                                            st.info(f"{fname} already matches what's on GitHub - nothing to push.")
+                                        st.rerun()
+                                    except (OSError, RuntimeError) as e:
+                                        st.error(f"Could not push {fname} to GitHub: {e}")
+                            with action_col3:
                                 st.download_button(
                                     "Download",
                                     data=content.encode('utf-8'),
