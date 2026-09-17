@@ -7,7 +7,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import os
 import io
-import subprocess
+import base64
 import difflib
 import requests
 
@@ -331,29 +331,47 @@ def _read_archive_file(fpath):
         return None
 
 
+GITHUB_REPO = "imethdesilva/WAR_Calculator"
+GITHUB_BRANCH = "main"
+
+
 def push_archive_file_to_github(fpath, commit_message):
-    """Commits and pushes fpath's current on-disk content straight to origin/main,
-    using the git checkout this app is already running from. Scopes 'git commit' to
-    just this path (via pathspec) so it never sweeps up unrelated uncommitted work
-    sitting elsewhere in the repo. Returns False if the file already matches what's
-    on GitHub (nothing to commit), True if a new commit was pushed."""
-    def run(args):
-        return subprocess.run(args, capture_output=True, text=True)
+    """Commits fpath's current on-disk content straight to GITHUB_REPO via GitHub's
+    Contents API (not the git CLI), so it works identically whether this app is run
+    locally or in a hosted container that has no git identity or push credentials
+    configured (e.g. a Streamlit Community Cloud deploy only has read access to the
+    repo checkout). Requires GITHUB_TOKEN in st.secrets - a token with write access to
+    this repo's contents. Returns False if the file already matches what's on GitHub
+    (nothing to commit), True if a new commit was made."""
+    token = st.secrets["GITHUB_TOKEN"]
+    repo_path = fpath.replace(os.sep, "/").lstrip("/")
 
-    add = run(["git", "add", "--", fpath])
-    if add.returncode != 0:
-        raise RuntimeError(add.stderr or add.stdout)
+    with open(fpath, "rb") as f:
+        encoded_content = base64.b64encode(f.read()).decode("ascii")
 
-    commit = run(["git", "commit", "-m", commit_message, "--", fpath])
-    if commit.returncode != 0:
-        if "nothing to commit" in (commit.stdout + commit.stderr).lower():
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{repo_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "WAR-Calculator-App",
+    }
+
+    get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=30)
+    existing_sha = None
+    if get_resp.status_code == 200:
+        existing = get_resp.json()
+        existing_sha = existing.get("sha")
+        if existing.get("content", "").replace("\n", "") == encoded_content:
             return False
-        raise RuntimeError(commit.stdout + commit.stderr)
+    elif get_resp.status_code != 404:
+        get_resp.raise_for_status()
 
-    push = run(["git", "push", "origin", "main"])
-    if push.returncode != 0:
-        raise RuntimeError(push.stdout + push.stderr)
+    payload = {"message": commit_message, "content": encoded_content, "branch": GITHUB_BRANCH}
+    if existing_sha:
+        payload["sha"] = existing_sha
 
+    put_resp = requests.put(api_url, headers=headers, json=payload, timeout=30)
+    put_resp.raise_for_status()
     return True
 
 
@@ -850,7 +868,7 @@ with tabs[1]:
                                                 f"in {fname} ({year})"
                                             ):
                                                 pushed_count += 1
-                                        except (OSError, RuntimeError) as e:
+                                        except (OSError, KeyError, requests.exceptions.RequestException) as e:
                                             push_errors.append(f"{fname}: {e}")
                                     if push_errors:
                                         st.error("Some files failed to push: " + "; ".join(push_errors))
@@ -1165,7 +1183,7 @@ with tabs[4]:
                                                 st.info(f"{fname} already matches what's on GitHub - "
                                                         f"nothing to push.")
                                             st.rerun()
-                                        except (OSError, RuntimeError) as e:
+                                        except (OSError, KeyError, requests.exceptions.RequestException) as e:
                                             st.error(f"Could not push {fname} to GitHub: {e}")
                                 with cancel_col:
                                     if st.button("Cancel", key=f"archive_push_cancel_{year}_{fname}"):
