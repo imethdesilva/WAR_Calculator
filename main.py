@@ -796,6 +796,8 @@ with tabs[1]:
                                "Tournament Archive tab.")
 
                     for name_a, name_b, kind in duplicate_pairs:
+                        merge_result_key = f"merge_result_{name_a}_{name_b}"
+
                         st.markdown(f"**{name_a}**  vs  **{name_b}**  -  {kind}")
                         merge_col1, merge_col2 = st.columns([3, 1])
                         with merge_col1:
@@ -815,14 +817,51 @@ with tabs[1]:
                                         st.session_state.engine, [name_a, name_b], canonical_name
                                     )
                                     if changed:
-                                        details = "; ".join(
-                                            f"{fname} ({year}, {count}x)" for year, fname, count in changed
-                                        )
-                                        st.success(f"Merged into \"{canonical_name}\" across "
-                                                   f"{len(changed)} file(s): {details}.")
+                                        st.session_state[merge_result_key] = {
+                                            "canonical": canonical_name, "changed": changed
+                                        }
+                                        st.rerun()
                                     else:
                                         st.info("No occurrences of either name were found in the "
                                                 "archive files.")
+
+                        merge_result = st.session_state.get(merge_result_key)
+                        if merge_result:
+                            details = "; ".join(
+                                f"{fname} ({year}, {count}x)" for year, fname, count in merge_result["changed"]
+                            )
+                            st.success(f"Merged into \"{merge_result['canonical']}\" across "
+                                       f"{len(merge_result['changed'])} file(s): {details}.")
+                            st.caption("Optional: push these files straight to GitHub (origin/main) now, "
+                                       "instead of reviewing/pushing each one individually from the "
+                                       "Tournament Archive tab.")
+                            push_col, dismiss_col = st.columns(2)
+                            with push_col:
+                                if st.button("Push These Changes to GitHub Now",
+                                             key=f"merge_push_{name_a}_{name_b}"):
+                                    push_errors = []
+                                    pushed_count = 0
+                                    for year, fname, count in merge_result["changed"]:
+                                        fpath = os.path.join(TOURNAMENT_ARCHIVE_DIR, year, fname)
+                                        try:
+                                            if push_archive_file_to_github(
+                                                fpath,
+                                                f"Merge player name to \"{merge_result['canonical']}\" "
+                                                f"in {fname} ({year})"
+                                            ):
+                                                pushed_count += 1
+                                        except (OSError, RuntimeError) as e:
+                                            push_errors.append(f"{fname}: {e}")
+                                    if push_errors:
+                                        st.error("Some files failed to push: " + "; ".join(push_errors))
+                                    else:
+                                        st.success(f"Pushed {pushed_count} file(s) to GitHub (origin/main).")
+                                        st.session_state[merge_result_key] = None
+                                        st.rerun()
+                            with dismiss_col:
+                                if st.button("Dismiss", key=f"merge_dismiss_{name_a}_{name_b}"):
+                                    st.session_state[merge_result_key] = None
+                                    st.rerun()
                         st.markdown("---")
 
             filter_col1, filter_col2 = st.columns(2)
