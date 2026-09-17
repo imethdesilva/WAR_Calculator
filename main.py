@@ -414,6 +414,40 @@ def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
     return rows
 
 
+def rename_player_across_archive(engine, old_names, new_name, base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Merges two (or more) name spellings into one canonical name by rewriting every
+    archived tournament file that contains any of old_names, so future uploads treat
+    them as a single player instead of silently splitting their WAR. Matches whole
+    names only (not as a substring of some other name) via word-boundary-style
+    lookaround. Returns a list of (year, fname, occurrences_replaced) for files that
+    were actually changed; writes those files to disk immediately."""
+    changed = []
+    patterns = [re.compile(r'(?<![A-Za-z])' + re.escape(old) + r'(?![A-Za-z])')
+                for old in old_names if old != new_name]
+    if not patterns:
+        return changed
+
+    for year, files in get_archive_structure(engine, base_dir):
+        for fname in files:
+            fpath = os.path.join(base_dir, year, fname)
+            content = _read_archive_file(fpath)
+            if content is None:
+                continue
+
+            new_content = content
+            total_count = 0
+            for pattern in patterns:
+                new_content, count = pattern.subn(new_name, new_content)
+                total_count += count
+
+            if total_count > 0:
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                changed.append((year, fname, total_count))
+
+    return changed
+
+
 def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf = io.StringIO()
     headers_map = threshold_headers(conf)
@@ -753,6 +787,43 @@ with tabs[1]:
                                   expanded=False):
                     dup_df = pd.DataFrame(duplicate_pairs, columns=["Name A", "Name B", "Match Type"])
                     st.dataframe(dup_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+                    st.caption("Merging rewrites the chosen name in every archived tournament file on "
+                               "disk (under 'tournament files/') so both spellings become one person "
+                               "going forward. After merging, re-upload/reprocess the files to refresh "
+                               "this leaderboard, and push the changed files to GitHub from the "
+                               "Tournament Archive tab.")
+
+                    for name_a, name_b, kind in duplicate_pairs:
+                        st.markdown(f"**{name_a}**  vs  **{name_b}**  -  {kind}")
+                        merge_col1, merge_col2 = st.columns([3, 1])
+                        with merge_col1:
+                            canonical = st.text_input(
+                                "Correct name to use for both",
+                                value=name_a,
+                                key=f"merge_canonical_{name_a}_{name_b}"
+                            )
+                        with merge_col2:
+                            st.markdown("&nbsp;", unsafe_allow_html=True)
+                            if st.button("Merge Names", key=f"merge_btn_{name_a}_{name_b}"):
+                                canonical_name = canonical.strip()
+                                if not canonical_name:
+                                    st.error("Enter the correct name before merging.")
+                                else:
+                                    changed = rename_player_across_archive(
+                                        st.session_state.engine, [name_a, name_b], canonical_name
+                                    )
+                                    if changed:
+                                        details = "; ".join(
+                                            f"{fname} ({year}, {count}x)" for year, fname, count in changed
+                                        )
+                                        st.success(f"Merged into \"{canonical_name}\" across "
+                                                   f"{len(changed)} file(s): {details}.")
+                                    else:
+                                        st.info("No occurrences of either name were found in the "
+                                                "archive files.")
+                        st.markdown("---")
 
             filter_col1, filter_col2 = st.columns(2)
             with filter_col1:
