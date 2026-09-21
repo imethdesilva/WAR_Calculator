@@ -846,9 +846,11 @@ def _pdf_table(data, col_widths=None):
 
 def _pdf_header(story, styles, title, subtitle):
     if os.path.exists(LOGO_PATH):
-        # Source logo is 783x319px - keep that aspect ratio at report scale.
-        logo_height = 1.4 * cm
-        story.append(Image(LOGO_PATH, width=logo_height * (783 / 319), height=logo_height))
+        # Source logo is a square mark (lion + tile + stacked wordmark).
+        logo_size = 2.6 * cm
+        logo = Image(LOGO_PATH, width=logo_size, height=logo_size)
+        logo.hAlign = 'CENTER'
+        story.append(logo)
         story.append(Spacer(1, 6))
     story.append(Paragraph(xml_escape(title), styles["ReportTitle"]))
     story.append(Paragraph(xml_escape(subtitle), styles["ReportSubtitle"]))
