@@ -400,7 +400,7 @@ def find_similar_player_names(names, ratio_threshold=0.85):
     return pairs
 
 
-LOGO_PATH = "assets/sfsl_logo.png"
+LOGO_PATH = "assets/fed_logo.png"
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
 DEFAULT_EVENT_DATE = "15.10.2025"
@@ -552,7 +552,7 @@ def rename_player_across_archive(engine, old_names, new_name, base_dir=TOURNAMEN
 def process_tournament_data(engine, mode, event_date_str, tournament_objects, ignore_q5_push=False):
     """Runs the full WAR pipeline (quad/cutoff calculation, per-player history build,
     inactivity detection) for one mode over a pool of already-parsed tournament objects,
-    exactly like the sidebar's manual upload flow. Shared so both that flow and the
+    exactly like the Archive tab's manual upload flow. Shared so both that flow and the
     archive-wide 'Run WAR for WYSC and WSC' button use identical logic instead of two
     copies drifting apart. Returns a result bundle dict, or None if tournament_objects
     is empty or the configuration failed (calculate_configuration already st.error's on
@@ -1017,6 +1017,11 @@ st.set_page_config(
 
 st.markdown("""
     <style>
+    /* 0. Trim the default top whitespace above the header */
+    .block-container {
+        padding-top: 2rem;
+    }
+
     /* 1. Metric Card Styling: Professional contrast for Dark and Light modes */
     div[data-testid="stMetric"] {
         background-color: var(--secondary-background-color);
@@ -1074,19 +1079,15 @@ if 'engine' not in st.session_state:
     st.session_state.active_mode = None
 
 # Main
-header_logo_col, header_title_col = st.columns([1, 6])
+header_logo_col, header_title_col = st.columns([1, 6], vertical_alignment="center")
 with header_logo_col:
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=140)
+        st.image(LOGO_PATH, width=110)
 with header_title_col:
     st.title("National Scrabble Selections - WAR Calculator")
     st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
-if not st.session_state.active_mode:
-    st.info("**Getting started:** open the **Tournament Archive** tab below, unlock it with the "
-            "archive password, then click **Run WAR for WYSC and WSC**. Once that finishes, "
-            "results appear in Selection Overview and National Leaderboard.")
-elif len(st.session_state.results) > 1:
+if st.session_state.active_mode and len(st.session_state.results) > 1:
     cached_modes = list(st.session_state.results.keys())
     current_idx = cached_modes.index(st.session_state.active_mode) if st.session_state.active_mode in cached_modes else 0
     viewing_mode = st.radio(
@@ -1097,7 +1098,7 @@ elif len(st.session_state.results) > 1:
     if viewing_mode != st.session_state.active_mode:
         sync_active_dataset(viewing_mode)
         st.rerun()
-else:
+elif st.session_state.active_mode:
     st.caption(f"Viewing dataset: **{st.session_state.active_mode}**")
 
 tabs = st.tabs(["Tournament Archive", "Selection Overview", "National Leaderboard",
@@ -1127,8 +1128,8 @@ with tabs[1]:
         st.subheader(f"Tournaments Considered for WAR ({st.session_state.config['mode']})")
         considered = build_considered_tournaments_table(st.session_state.players_db)
         if not considered:
-            st.info("No tournaments have been included yet - process files in the sidebar or run "
-                    "the archive-wide WAR calculation first.")
+            st.info("No tournaments have been included yet - run WAR from the Tournament "
+                    "Archive tab first.")
         else:
             considered_df = pd.DataFrame(considered)
             considered_df.insert(0, "No.", range(1, len(considered_df) + 1))
@@ -1151,7 +1152,7 @@ with tabs[1]:
             mime="application/pdf"
         )
     else:
-        st.info("Awaiting Configuration. Please initialize the selection window in the sidebar.")
+        st.info("Awaiting configuration. Run WAR from the Tournament Archive tab to get started.")
 
 # Leaderboard
 with tabs[2]:
@@ -1455,6 +1456,10 @@ with tabs[0]:
             else:
                 st.error("Incorrect password.")
     else:
+        if not st.session_state.active_mode:
+            st.info("**Getting started:** click **Run WAR for WYSC and WSC** below. Once that "
+                    "finishes, results appear in Selection Overview and National Leaderboard.")
+
         top_col, reset_col, refresh_col, lock_col = st.columns([3, 1, 1, 1])
         with top_col:
             st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
