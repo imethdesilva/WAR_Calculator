@@ -458,6 +458,34 @@ def push_archive_file_to_github(fpath, commit_message):
     return True
 
 
+def delete_archive_file_from_github(repo_path, commit_message):
+    """Deletes repo_path from GITHUB_REPO via the Contents API. Used when a local
+    rename needs to remove the old filename on GitHub too - the Contents API has no
+    atomic rename, so a rename there is represented as a delete-old + create-new pair
+    of commits. Returns False if the path doesn't exist on GitHub (nothing to
+    delete), True if it was deleted."""
+    token = st.secrets["GITHUB_TOKEN"]
+    repo_path = repo_path.replace(os.sep, "/").lstrip("/")
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{repo_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "WAR-Calculator-App",
+    }
+
+    get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=30)
+    if get_resp.status_code == 404:
+        return False
+    get_resp.raise_for_status()
+    sha = get_resp.json()["sha"]
+
+    payload = {"message": commit_message, "sha": sha, "branch": GITHUB_BRANCH}
+    del_resp = requests.delete(api_url, headers=headers, json=payload, timeout=30)
+    del_resp.raise_for_status()
+    return True
+
+
 def get_archive_structure(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
     """Returns an ordered list of (year, [filenames]) tuples for whatever year
     subfolders exist under base_dir - years newest-first, and files within each year
@@ -846,9 +874,9 @@ def _pdf_table(data, col_widths=None):
 
 def _pdf_header(story, styles, title, subtitle):
     if os.path.exists(LOGO_PATH):
-        # Source logo is a square mark (lion + tile + stacked wordmark).
-        logo_size = 2.6 * cm
-        logo = Image(LOGO_PATH, width=logo_size, height=logo_size)
+        # Source logo is a wide mark (lion + tile beside the wordmark), 783x319px.
+        logo_height = 1.5 * cm
+        logo = Image(LOGO_PATH, width=logo_height * (783 / 319), height=logo_height)
         logo.hAlign = 'CENTER'
         story.append(logo)
         story.append(Spacer(1, 6))
@@ -1079,10 +1107,10 @@ if 'engine' not in st.session_state:
     st.session_state.active_mode = None
 
 # Main
-header_logo_col, header_title_col = st.columns([1, 6], vertical_alignment="center")
+header_logo_col, header_title_col = st.columns([2, 5], vertical_alignment="center")
 with header_logo_col:
     if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=110)
+        st.image(LOGO_PATH, width=220)
 with header_title_col:
     st.title("National Scrabble Selections - WAR Calculator")
     st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
@@ -1689,35 +1717,74 @@ with tabs[0]:
                                         st.rerun()
 
                             if st.session_state.get(confirm_key):
-                                st.warning("This pushes directly to the public GitHub repo (origin/main) "
-                                           "with no review step. Confirm you want to publish this edit.")
+                                is_rename = new_fname and new_fname != fname
+                                if is_rename:
+                                    st.warning(f"This renames '{fname}' to '{new_fname}' and pushes the "
+                                               f"content directly to the public GitHub repo (origin/main) "
+                                               f"- both the new file and removal of the old one - with no "
+                                               f"review step. Confirm you want to publish this.")
+                                else:
+                                    st.warning("This pushes directly to the public GitHub repo (origin/main) "
+                                               "with no review step. Confirm you want to publish this edit.")
                                 diff_lines = list(difflib.unified_diff(
                                     content.splitlines(), edited_text.splitlines(),
                                     fromfile="on disk", tofile="your edit", lineterm=""
                                 ))
                                 if diff_lines:
                                     st.code("\n".join(diff_lines), language="diff")
-                                else:
+                                elif not is_rename:
                                     st.caption("No textual changes detected - this will push the file as-is.")
 
                                 confirm_col, cancel_col = st.columns(2)
                                 with confirm_col:
                                     if st.button("Confirm & Push", key=f"archive_push_confirm_btn_{year}_{fname}"):
-                                        try:
-                                            with open(fpath, "w", encoding="utf-8") as f:
-                                                f.write(edited_text)
-                                            pushed = push_archive_file_to_github(
-                                                fpath, f"Edit {fname} ({year}) via WAR Calculator dashboard"
-                                            )
-                                            st.session_state[confirm_key] = False
-                                            if pushed:
-                                                st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
-                                            else:
-                                                st.info(f"{fname} already matches what's on GitHub - "
-                                                        f"nothing to push.")
-                                            st.rerun()
-                                        except (OSError, KeyError, requests.exceptions.RequestException) as e:
-                                            st.error(f"Could not push {fname} to GitHub: {e}")
+                                        if not new_fname:
+                                            st.error("File name can't be empty.")
+                                        elif not new_fname.lower().endswith(".txt"):
+                                            st.error("File name must end in .txt")
+                                        else:
+                                            new_fpath = os.path.join(TOURNAMENT_ARCHIVE_DIR, year, new_fname)
+                                            try:
+                                                with open(new_fpath, "w", encoding="utf-8") as f:
+                                                    f.write(edited_text)
+                                                if is_rename and os.path.exists(fpath):
+                                                    os.remove(fpath)
+
+                                                commit_msg = (
+                                                    f"Rename {fname} to {new_fname} ({year}) via WAR "
+                                                    f"Calculator dashboard" if is_rename else
+                                                    f"Edit {fname} ({year}) via WAR Calculator dashboard"
+                                                )
+                                                pushed = push_archive_file_to_github(new_fpath, commit_msg)
+
+                                                removed_old = False
+                                                if is_rename:
+                                                    old_repo_path = os.path.join(
+                                                        TOURNAMENT_ARCHIVE_DIR, year, fname
+                                                    )
+                                                    removed_old = delete_archive_file_from_github(
+                                                        old_repo_path,
+                                                        f"Remove {fname} ({year}) - renamed to "
+                                                        f"{new_fname} via WAR Calculator dashboard"
+                                                    )
+
+                                                st.session_state[confirm_key] = False
+                                                if is_rename:
+                                                    st.success(
+                                                        f"Renamed '{fname}' to '{new_fname}' on GitHub"
+                                                        + (" and removed the old file there."
+                                                           if removed_old else
+                                                           " (old file wasn't on GitHub, nothing to "
+                                                           "remove there).")
+                                                    )
+                                                elif pushed:
+                                                    st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
+                                                else:
+                                                    st.info(f"{fname} already matches what's on GitHub - "
+                                                            f"nothing to push.")
+                                                st.rerun()
+                                            except (OSError, KeyError, requests.exceptions.RequestException) as e:
+                                                st.error(f"Could not push {new_fname} to GitHub: {e}")
                                 with cancel_col:
                                     if st.button("Cancel", key=f"archive_push_cancel_{year}_{fname}"):
                                         st.session_state[confirm_key] = False
