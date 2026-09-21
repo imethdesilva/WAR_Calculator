@@ -17,7 +17,7 @@ from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image
 )
 
 class SelectionsEngine:
@@ -400,6 +400,7 @@ def find_similar_player_names(names, ratio_threshold=0.85):
     return pairs
 
 
+LOGO_PATH = "assets/sfsl_logo.png"
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
 DEFAULT_EVENT_DATE = "15.10.2025"
@@ -844,6 +845,11 @@ def _pdf_table(data, col_widths=None):
 
 
 def _pdf_header(story, styles, title, subtitle):
+    if os.path.exists(LOGO_PATH):
+        # Source logo is 783x319px - keep that aspect ratio at report scale.
+        logo_height = 1.4 * cm
+        story.append(Image(LOGO_PATH, width=logo_height * (783 / 319), height=logo_height))
+        story.append(Spacer(1, 6))
     story.append(Paragraph(xml_escape(title), styles["ReportTitle"]))
     story.append(Paragraph(xml_escape(subtitle), styles["ReportSubtitle"]))
     story.append(HRFlowable(width="100%", color=colors.black, thickness=1.2, spaceAfter=12))
@@ -1002,7 +1008,10 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
 
 
 # UI
-st.set_page_config(page_title="National Selections Dashboard", layout="wide")
+st.set_page_config(
+    page_title="National Selections Dashboard", layout="wide",
+    page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else None
+)
 
 st.markdown("""
     <style>
@@ -1063,8 +1072,13 @@ if 'engine' not in st.session_state:
     st.session_state.active_mode = None
 
 # Main
-st.title("National Scrabble Selections - WAR Calculator")
-st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
+header_logo_col, header_title_col = st.columns([1, 6])
+with header_logo_col:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, width=140)
+with header_title_col:
+    st.title("National Scrabble Selections - WAR Calculator")
+    st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
 if not st.session_state.active_mode:
     st.info("**Getting started:** open the **Tournament Archive** tab below, unlock it with the "
