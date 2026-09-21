@@ -500,14 +500,14 @@ def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
                 continue
 
             distinct_players = {p['name'] for p in data['players']}
-            game_counts = sorted({p['games'] for p in data['players']})
+            game_counts = [p['games'] for p in data['players']]
 
             rows.append({
                 "Date": data['date'],
                 "Tournament Name": data['name'],
                 "Year Folder": year,
                 "Players": len(distinct_players),
-                "Division Sizes (games)": ", ".join(str(g) for g in game_counts) if game_counts else "-",
+                "Division Size (games)": max(game_counts) if game_counts else "-",
                 "Source File": fname,
             })
 
@@ -1442,7 +1442,29 @@ with tabs[4]:
 
 # Tournament Archive
 with tabs[0]:
-    st.header("Tournament File Archive")
+    archive_ready = ARCHIVE_PASSWORD and st.session_state.archive_unlocked
+
+    if archive_ready:
+        header_col, reset_col, refresh_col, lock_col = st.columns(
+            [5, 1, 1, 1], gap="small", vertical_alignment="bottom"
+        )
+        with header_col:
+            st.header("Tournament File Archive")
+        with reset_col:
+            if st.button("Reset Dataset", help="Clears the currently computed WAR results and "
+                                                "returns the dashboard to its initial state. "
+                                                "Doesn't touch any archive files."):
+                reset_dataset()
+                st.rerun()
+        with refresh_col:
+            if st.button("Refresh"):
+                st.rerun()
+        with lock_col:
+            if st.button("Lock"):
+                st.session_state.archive_unlocked = False
+                st.rerun()
+    else:
+        st.header("Tournament File Archive")
 
     if not ARCHIVE_PASSWORD:
         st.error("ARCHIVE_PASSWORD is not set in .streamlit/secrets.toml - add it to enable this section.")
@@ -1459,24 +1481,6 @@ with tabs[0]:
         if not st.session_state.active_mode:
             st.info("**Getting started:** click **Run WAR for WYSC and WSC** below. Once that "
                     "finishes, results appear in Selection Overview and National Leaderboard.")
-
-        top_col, reset_col, refresh_col, lock_col = st.columns([3, 1, 1, 1])
-        with top_col:
-            st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
-                       "tournaments within each year sorted latest-first.")
-        with reset_col:
-            if st.button("Reset Dataset", help="Clears the currently computed WAR results and "
-                                                "returns the dashboard to its initial state. "
-                                                "Doesn't touch any archive files."):
-                reset_dataset()
-                st.rerun()
-        with refresh_col:
-            if st.button("Refresh"):
-                st.rerun()
-        with lock_col:
-            if st.button("Lock"):
-                st.session_state.archive_unlocked = False
-                st.rerun()
 
         st.markdown("---")
         st.subheader("Run WAR for WYSC and WSC")
@@ -1547,91 +1551,6 @@ with tabs[0]:
                 st.rerun()
 
         st.markdown("---")
-        with st.expander("Advanced: Manual / One-off Upload"):
-            st.caption("For testing a single mode against a handful of files outside the archive, "
-                       "instead of the full archive-wide run above.")
-            manual_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"], key="manual_mode")
-            manual_event_date = st.text_input(
-                "International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="manual_event_date"
-            )
-            manual_ignore_q5 = st.toggle(
-                "Ignore Q5 Push (Live View)", value=False, key="manual_ignore_q5",
-                help="Official selection rules push Q5 back a full quadrimester when it's still empty "
-                     "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
-                     "quadrimester, so you can watch live WAR update as new results come in, ahead of "
-                     "the official cutoff determination."
-            )
-
-            if st.button("Initialize Selection Window (Preview)", key="manual_init_window"):
-                config, quads = st.session_state.engine.calculate_configuration(
-                    manual_mode, manual_event_date,
-                    tournament_dates=st.session_state.uploaded_tournament_dates,
-                    ignore_q5_push=manual_ignore_q5
-                )
-                if config:
-                    st.session_state.config = config
-                    st.session_state.quad_ranges = quads
-                    if manual_ignore_q5:
-                        st.warning("Live View active: Q5 push-back rule is disabled. This is for "
-                                   "monitoring current-form WAR only, not official selection.")
-                    elif not st.session_state.uploaded_tournament_dates:
-                        st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed "
-                                "empty per the PDF's 'no tournament held' rule until real results "
-                                "are processed.")
-                    st.success("Configuration Validated")
-
-            manual_uploaded_files = st.file_uploader(
-                "Upload Tournament Files (.txt)", accept_multiple_files=True, key="manual_uploader"
-            )
-            if manual_uploaded_files and st.button("Process Tournament Results", key="manual_process"):
-                parsed_tournament_objects = []
-                for f in manual_uploaded_files:
-                    content = f.read().decode('utf-8', errors='ignore')
-                    data = st.session_state.engine.parse_tournament_file(content)
-                    if data:
-                        data['source_filename'] = f.name
-                        parsed_tournament_objects.append(data)
-
-                if not parsed_tournament_objects:
-                    st.error("No valid tournament data found in uploaded files.")
-                else:
-                    bundle = process_tournament_data(
-                        st.session_state.engine, manual_mode, manual_event_date,
-                        parsed_tournament_objects, ignore_q5_push=manual_ignore_q5
-                    )
-                    if bundle:
-                        st.session_state.results[manual_mode] = bundle
-                        sync_active_dataset(manual_mode)
-                        st.success("Calculated WAR using Seasonal Calendar Weights")
-                        st.rerun()
-
-        with st.expander("Add Tournament File"):
-            st.caption("Writes a new file directly into the archive folder on disk.")
-            add_year = st.text_input(
-                "Year folder (e.g. 2026 - created if it doesn't exist)", key="add_file_year"
-            )
-            add_fname = st.text_input("File name (e.g. MyTournament.txt)", key="add_file_name")
-            add_content = st.text_area("File contents", height=200, key="add_file_content")
-            if st.button("Add File", key="add_file_btn"):
-                if not add_year.strip() or not add_fname.strip():
-                    st.error("Enter both a year folder and a file name.")
-                elif not add_fname.strip().lower().endswith(".txt"):
-                    st.error("File name must end in .txt")
-                else:
-                    year_clean = add_year.strip()
-                    fname_clean = add_fname.strip()
-                    target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, year_clean)
-                    target_path = os.path.join(target_dir, fname_clean)
-                    if os.path.exists(target_path):
-                        st.error(f"'{fname_clean}' already exists in '{year_clean}/' - use the "
-                                 f"editor below to modify it instead.")
-                    else:
-                        os.makedirs(target_dir, exist_ok=True)
-                        with open(target_path, "w", encoding="utf-8") as f:
-                            f.write(add_content)
-                        st.success(f"Added '{fname_clean}' to '{year_clean}/'.")
-                        st.rerun()
-        st.markdown("---")
 
         structure = get_archive_structure(st.session_state.engine)
         if not structure:
@@ -1666,6 +1585,9 @@ with tabs[0]:
                             else:
                                 st.caption("Could not parse tournament metadata from this file.")
 
+                            fname_key = f"archive_fname_{year}_{fname}"
+                            st.text_input("File name", value=fname, key=fname_key)
+
                             text_key = f"archive_view_{year}_{fname}"
                             st.text_area(
                                 "File Contents (edit player names or any other text directly, then Save)",
@@ -1694,17 +1616,34 @@ with tabs[0]:
 
                             confirm_key = f"archive_push_confirm_{year}_{fname}"
                             delete_confirm_key = f"archive_delete_confirm_{year}_{fname}"
+                            new_fname = st.session_state[fname_key].strip()
 
-                            action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+                            action_col1, action_col2, action_col3, action_col4, _spacer = st.columns(
+                                [1, 1, 1, 1, 3], gap="small"
+                            )
                             with action_col1:
                                 if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
-                                    try:
-                                        with open(fpath, "w", encoding="utf-8") as f:
-                                            f.write(edited_text)
-                                        st.success(f"Saved changes to {fname} on this machine.")
-                                        st.rerun()
-                                    except OSError as e:
-                                        st.error(f"Could not save {fname}: {e}")
+                                    if not new_fname:
+                                        st.error("File name can't be empty.")
+                                    elif not new_fname.lower().endswith(".txt"):
+                                        st.error("File name must end in .txt")
+                                    else:
+                                        new_fpath = os.path.join(TOURNAMENT_ARCHIVE_DIR, year, new_fname)
+                                        if new_fname != fname and os.path.exists(new_fpath):
+                                            st.error(f"'{new_fname}' already exists in '{year}/'.")
+                                        else:
+                                            try:
+                                                with open(new_fpath, "w", encoding="utf-8") as f:
+                                                    f.write(edited_text)
+                                                if new_fname != fname:
+                                                    os.remove(fpath)
+                                                    st.success(f"Saved as '{new_fname}' (renamed from "
+                                                               f"'{fname}') on this machine.")
+                                                else:
+                                                    st.success(f"Saved changes to {fname} on this machine.")
+                                                st.rerun()
+                                            except OSError as e:
+                                                st.error(f"Could not save {new_fname}: {e}")
                             with action_col2:
                                 if st.button("Push Changes to GitHub", key=f"archive_push_{year}_{fname}"):
                                     st.session_state[confirm_key] = True
@@ -1796,3 +1735,117 @@ with tabs[0]:
                     hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
                     st.dataframe(hist_df, use_container_width=True, hide_index=True)
                     st.caption(f"{len(history_rows)} tournaments found across {len(structure)} year folder(s).")
+        st.markdown("---")
+        with st.expander("Advanced: Manual / One-off Upload"):
+            st.caption("For testing a single mode against a handful of files outside the archive, "
+                       "instead of the full archive-wide run above.")
+            manual_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"], key="manual_mode")
+            manual_event_date = st.text_input(
+                "International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="manual_event_date"
+            )
+            manual_ignore_q5 = st.toggle(
+                "Ignore Q5 Push (Live View)", value=False, key="manual_ignore_q5",
+                help="Official selection rules push Q5 back a full quadrimester when it's still empty "
+                     "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
+                     "quadrimester, so you can watch live WAR update as new results come in, ahead of "
+                     "the official cutoff determination."
+            )
+
+            if st.button("Initialize Selection Window (Preview)", key="manual_init_window"):
+                config, quads = st.session_state.engine.calculate_configuration(
+                    manual_mode, manual_event_date,
+                    tournament_dates=st.session_state.uploaded_tournament_dates,
+                    ignore_q5_push=manual_ignore_q5
+                )
+                if config:
+                    st.session_state.config = config
+                    st.session_state.quad_ranges = quads
+                    if manual_ignore_q5:
+                        st.warning("Live View active: Q5 push-back rule is disabled. This is for "
+                                   "monitoring current-form WAR only, not official selection.")
+                    elif not st.session_state.uploaded_tournament_dates:
+                        st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed "
+                                "empty per the PDF's 'no tournament held' rule until real results "
+                                "are processed.")
+                    st.success("Configuration Validated")
+
+            manual_uploaded_files = st.file_uploader(
+                "Upload Tournament Files (.txt)", accept_multiple_files=True, key="manual_uploader"
+            )
+            if manual_uploaded_files and st.button("Process Tournament Results", key="manual_process"):
+                parsed_tournament_objects = []
+                for f in manual_uploaded_files:
+                    content = f.read().decode('utf-8', errors='ignore')
+                    data = st.session_state.engine.parse_tournament_file(content)
+                    if data:
+                        data['source_filename'] = f.name
+                        parsed_tournament_objects.append(data)
+
+                if not parsed_tournament_objects:
+                    st.error("No valid tournament data found in uploaded files.")
+                else:
+                    bundle = process_tournament_data(
+                        st.session_state.engine, manual_mode, manual_event_date,
+                        parsed_tournament_objects, ignore_q5_push=manual_ignore_q5
+                    )
+                    if bundle:
+                        st.session_state.results[manual_mode] = bundle
+                        sync_active_dataset(manual_mode)
+                        st.success("Calculated WAR using Seasonal Calendar Weights")
+                        st.rerun()
+
+        with st.expander("Add Tournament File"):
+            st.caption("Upload a .txt file directly - the year folder is detected automatically "
+                       "from the date in the file.")
+            uploaded_new_file = st.file_uploader(
+                "Upload a tournament .txt file", type=["txt"], key="add_file_uploader"
+            )
+            if uploaded_new_file is not None:
+                uploaded_content = uploaded_new_file.read().decode('utf-8', errors='ignore')
+                uploaded_data = st.session_state.engine.parse_tournament_file(uploaded_content)
+                if not uploaded_data:
+                    st.error("Could not detect a tournament date in the first 5 lines of this "
+                             "file - it doesn't look like a valid results file.")
+                else:
+                    detected_year = str(uploaded_data['date'].year)
+                    st.success(f"Detected: **{uploaded_data['name'] or 'Unknown tournament'}** on "
+                               f"{uploaded_data['date']:%Y-%m-%d} - will be added to "
+                               f"'{detected_year}/'.")
+                    upload_target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, detected_year)
+                    upload_target_path = os.path.join(upload_target_dir, uploaded_new_file.name)
+                    if os.path.exists(upload_target_path):
+                        st.error(f"'{uploaded_new_file.name}' already exists in '{detected_year}/' "
+                                 f"- use the editor in the archive list below to modify it instead.")
+                    elif st.button("Add Uploaded File to Archive", key="add_file_upload_btn"):
+                        os.makedirs(upload_target_dir, exist_ok=True)
+                        with open(upload_target_path, "w", encoding="utf-8") as f:
+                            f.write(uploaded_content)
+                        st.success(f"Added '{uploaded_new_file.name}' to '{detected_year}/'.")
+                        st.rerun()
+
+            st.markdown("---")
+            st.caption("Or paste file contents in manually, and pick the year folder yourself:")
+            add_year = st.text_input(
+                "Year folder (e.g. 2026 - created if it doesn't exist)", key="add_file_year"
+            )
+            add_fname = st.text_input("File name (e.g. MyTournament.txt)", key="add_file_name")
+            add_content = st.text_area("File contents", height=200, key="add_file_content")
+            if st.button("Add File", key="add_file_btn"):
+                if not add_year.strip() or not add_fname.strip():
+                    st.error("Enter both a year folder and a file name.")
+                elif not add_fname.strip().lower().endswith(".txt"):
+                    st.error("File name must end in .txt")
+                else:
+                    year_clean = add_year.strip()
+                    fname_clean = add_fname.strip()
+                    target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, year_clean)
+                    target_path = os.path.join(target_dir, fname_clean)
+                    if os.path.exists(target_path):
+                        st.error(f"'{fname_clean}' already exists in '{year_clean}/' - use the "
+                                 f"editor below to modify it instead.")
+                    else:
+                        os.makedirs(target_dir, exist_ok=True)
+                        with open(target_path, "w", encoding="utf-8") as f:
+                            f.write(add_content)
+                        st.success(f"Added '{fname_clean}' to '{year_clean}/'.")
+                        st.rerun()
