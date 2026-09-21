@@ -10,6 +10,15 @@ import io
 import base64
 import difflib
 import requests
+from xml.sax.saxutils import escape as xml_escape
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+)
 
 class SelectionsEngine:
     def __init__(self):
@@ -318,7 +327,7 @@ def build_considered_tournaments_table(players_db):
             seen[key]["Players Considered"] += 1
 
     rows = list(seen.values())
-    rows.sort(key=lambda r: r["Date"])
+    rows.sort(key=lambda r: r["Date"], reverse=True)
     return rows
 
 
@@ -637,6 +646,22 @@ def sync_active_dataset(mode):
     st.session_state.active_mode = mode
 
 
+def reset_dataset():
+    """Clears every computed WAR result so the app goes back to its initial,
+    unconfigured state - used by the Archive tab's 'Reset Dataset' button. Does not
+    touch the archive files themselves, only the in-memory results."""
+    st.session_state.results = {}
+    st.session_state.active_mode = None
+    st.session_state.processed_files = False
+    st.session_state.players_db = {}
+    st.session_state.full_history_db = {}
+    st.session_state.inactivity_map = {}
+    st.session_state.uploaded_tournament_dates = []
+    st.session_state.upload_warnings = {}
+    st.session_state.pop('config', None)
+    st.session_state.pop('quad_ranges', None)
+
+
 def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf = io.StringIO()
     headers_map = threshold_headers(conf)
@@ -664,7 +689,7 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
         data = players_db.get(name)
         if data:
             h_df = pd.DataFrame(data["history"])
-            h_df = h_df.sort_values(by="Date")
+            h_df = h_df.sort_values(by="Date", ascending=False)
             h_df.to_csv(buf, index=False, lineterminator='\n')
             war, war_precise = compute_war(data['history'])
             tw = sum(h['Weight'] for h in data['history'])
@@ -703,6 +728,223 @@ def push_csv_to_pythonanywhere(csv_text, filename):
         timeout=30,
     )
     response.raise_for_status()
+
+
+PDF_NAVY = colors.HexColor("#004a99")
+PDF_LIGHT_ROW = colors.HexColor("#f2f6fb")
+PDF_BORDER = colors.HexColor("#c9c9c9")
+PDF_GREEN = colors.HexColor("#1e7e34")
+PDF_RED = colors.HexColor("#b02a37")
+PDF_AMBER = colors.HexColor("#8a6d00")
+
+_PDF_CELL_STYLE = ParagraphStyle(
+    "PdfCell", fontName="Helvetica", fontSize=8, leading=10, alignment=TA_CENTER
+)
+
+
+def _pdf_cell(text):
+    """Wraps a table cell's text in a Paragraph so long strings (e.g. a long
+    tournament name) wrap within the column instead of overflowing into the next
+    cell - a plain string in a reportlab Table never wraps, no matter how narrow
+    the column is."""
+    return Paragraph(xml_escape(str(text)), _PDF_CELL_STYLE)
+
+
+def _pdf_styles():
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="ReportTitle", parent=styles["Title"], textColor=PDF_NAVY, fontSize=19, spaceAfter=4
+    ))
+    styles.add(ParagraphStyle(
+        name="ReportSubtitle", parent=styles["Normal"], textColor=colors.grey, fontSize=9, spaceAfter=12
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeading", parent=styles["Heading2"], textColor=PDF_NAVY, fontSize=13,
+        spaceBefore=14, spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        name="PlayerHeading", parent=styles["Heading3"], textColor=PDF_NAVY, fontSize=11.5,
+        spaceBefore=10, spaceAfter=2
+    ))
+    styles.add(ParagraphStyle(name="BodySmall", parent=styles["Normal"], fontSize=8.5, leading=11))
+    return styles
+
+
+def _pdf_table(data, col_widths=None):
+    """Shared 'house style' for every data table in both reports: navy header row,
+    alternating light-blue body rows, thin grey gridlines, centered small text."""
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+    style = [
+        ('BACKGROUND', (0, 0), (-1, 0), PDF_NAVY),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.5, PDF_BORDER),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]
+    for row_idx in range(2, len(data), 2):
+        style.append(('BACKGROUND', (0, row_idx), (-1, row_idx), PDF_LIGHT_ROW))
+    table.setStyle(TableStyle(style))
+    return table
+
+
+def _pdf_header(story, styles, title, subtitle):
+    story.append(Paragraph(xml_escape(title), styles["ReportTitle"]))
+    story.append(Paragraph(xml_escape(subtitle), styles["ReportSubtitle"]))
+    story.append(HRFlowable(width="100%", color=PDF_NAVY, thickness=1.2, spaceAfter=12))
+
+
+def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tournaments):
+    """Builds the 'Generate Report' PDF: calculation specifics (cutoff date, event
+    date, thresholds), the quadrimester weighting schedule, a qualification summary,
+    and the full list of tournaments considered for WAR (latest first) - everything
+    needed to audit how this mode's results were derived. Per-player detail lives in
+    generate_all_players_audit_pdf() instead, to keep this one short and scannable."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.6*cm, bottomMargin=1.6*cm,
+        title=f"{conf['mode']} Selections Report"
+    )
+    styles = _pdf_styles()
+    story = []
+
+    _pdf_header(
+        story, styles, f"National Selections Report - {conf['mode']}",
+        f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')} - "
+        f"Scrabble Federation of Sri Lanka - WAR Calculator"
+    )
+
+    story.append(Paragraph("Calculation Details", styles["SectionHeading"]))
+    qualified_count = sum(1 for r in rows if r["Status"] == "QUALIFIED")
+    details_data = [
+        ["Tournament Classification", conf['mode']],
+        ["International Event Date", conf['intl_date'].strftime('%d %b %Y')],
+        ["Cut-off Date", conf['cutoff_date'].strftime('%d %b %Y')],
+        ["Minimum WAR Required", str(conf['min_war'])],
+        ["Minimum Games Required", str(conf['req_games'])],
+        ["Minimum Tournaments Required", str(conf['req_tours'])],
+        ["Minimum Quadrimesters Required", str(conf['min_quads'])],
+        ["Recent Activity Requirement", f"{conf['req_recent']} tournament(s) in Q4/Q5"],
+        ["Players Assessed", str(len(rows))],
+        ["Players Qualified", str(qualified_count)],
+    ]
+    detail_table = Table(details_data, colWidths=[7*cm, 8.2*cm])
+    detail_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('TEXTCOLOR', (0, 0), (0, -1), PDF_NAVY),
+        ('GRID', (0, 0), (-1, -1), 0.4, PDF_BORDER),
+        ('BACKGROUND', (0, 0), (0, -1), PDF_LIGHT_ROW),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(detail_table)
+
+    story.append(Paragraph("Quadrimester Weighting Schedule", styles["SectionHeading"]))
+    quad_data = [["Period", "Weight Factor", "Start", "End"]]
+    for q in quad_ranges:
+        quad_data.append([
+            f"Q{q['quad']}", f"{q['weight']:.2f}",
+            q['start'].strftime('%Y-%m-%d'), q['end'].strftime('%Y-%m-%d')
+        ])
+    story.append(_pdf_table(quad_data, col_widths=[3*cm, 3.5*cm, 4.4*cm, 4.4*cm]))
+
+    story.append(Paragraph("Tournaments Considered for WAR (Latest First)", styles["SectionHeading"]))
+    if not considered_tournaments:
+        story.append(Paragraph("No tournaments contributed to this calculation.", styles["BodySmall"]))
+    else:
+        t_data = [["#", "Tournament", "Date", "Quad", "Weight", "Players"]]
+        for i, t in enumerate(considered_tournaments, start=1):
+            t_data.append([
+                str(i), _pdf_cell(t["Tournament"]), t["Date"], f"Q{t['Quadrimester']}",
+                f"{t['Weight Factor']:.2f}", str(t["Players Considered"])
+            ])
+        story.append(_pdf_table(t_data, col_widths=[0.9*cm, 7.5*cm, 2.4*cm, 1.5*cm, 1.8*cm, 1.6*cm]))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
+    """Builds the 'Generate Report for All Players' PDF: one audit section per
+    player, in the same highest-WAR-first order as the leaderboard, each with a
+    summary table and their full tournament history (latest first) - the PDF
+    equivalent of the Individual Player Audit tab, covering every player at once."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.6*cm, bottomMargin=1.6*cm,
+        title=f"{conf['mode']} Individual Player Audits"
+    )
+    styles = _pdf_styles()
+    status_style_qualified = ParagraphStyle("StatusQ", parent=styles["BodySmall"], textColor=PDF_GREEN, spaceAfter=4)
+    status_style_ineligible = ParagraphStyle("StatusI", parent=styles["BodySmall"], textColor=PDF_RED, spaceAfter=4)
+    remark_style = ParagraphStyle("Remark", parent=styles["BodySmall"], textColor=PDF_AMBER, spaceBefore=3)
+    story = []
+
+    _pdf_header(
+        story, styles, f"Individual Player Audit Report - {conf['mode']}",
+        f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')} - {len(rows_sorted)} player(s), "
+        f"ranked by highest WAR first - Scrabble Federation of Sri Lanka - WAR Calculator"
+    )
+
+    for idx, row in enumerate(rows_sorted, start=1):
+        name = row["Player Name"]
+
+        story.append(Paragraph(f"{idx}. {xml_escape(name)}", styles["PlayerHeading"]))
+        status_style = status_style_qualified if row["Status"] == "QUALIFIED" else status_style_ineligible
+        story.append(Paragraph(f"WAR: {row['WAR']}  |  Status: {row['Status']}", status_style))
+
+        summary_data = [
+            ["Current Rating", str(row["Current Rating"]), "WAR (precise)", f"{row['WAR Precise']:.2f}"],
+            ["Quadrimesters", str(row["Quads"]), "Tournaments", str(row["Tournaments"])],
+            ["Total Games", str(row["Total Games"]), "Major Tournaments", str(row["Majors"])],
+            ["Recent Activity", str(row["Recent"]), "", ""],
+        ]
+        summary_table = Table(summary_data, colWidths=[3.3*cm, 3*cm, 3.6*cm, 3*cm])
+        summary_table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('GRID', (0, 0), (-1, -1), 0.3, PDF_BORDER),
+            ('BACKGROUND', (0, 0), (0, -1), PDF_LIGHT_ROW),
+            ('BACKGROUND', (2, 0), (2, -1), PDF_LIGHT_ROW),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 4))
+
+        data = players_db.get(name)
+        if data and data["history"]:
+            history_sorted = sorted(data["history"], key=lambda h: h["Date"], reverse=True)
+            hist_data = [["Date", "Tournament", "Quad", "Weight", "Old", "New", "Games"]]
+            for h in history_sorted:
+                hist_data.append([
+                    h["Date"], _pdf_cell(h["Tournament"]), f"Q{h['Quad']}", f"{h['Weight']:.2f}",
+                    str(h["Old Rating"]), str(h["New Rating"]), str(h["Games"])
+                ])
+            story.append(_pdf_table(
+                hist_data, col_widths=[1.9*cm, 6.5*cm, 1.1*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.3*cm]
+            ))
+        else:
+            story.append(Paragraph(
+                "No qualifying (non-provisional, in-window) tournament history found.", styles["BodySmall"]
+            ))
+
+        if row["Remarks"]:
+            story.append(Paragraph(f"Remark: {xml_escape(row['Remarks'])}", remark_style))
+
+        story.append(Spacer(1, 10))
+        story.append(HRFlowable(width="100%", color=PDF_BORDER, thickness=0.5, spaceAfter=8))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 # UI
@@ -881,6 +1123,20 @@ with tabs[0]:
             st.caption(f"{len(considered)} tournament(s) fell within a quadrimester and contributed "
                        f"to WAR for {st.session_state.config['mode']}. Tournaments outside the 20-month "
                        f"window, or with only provisional results, are omitted from this list.")
+
+        overview_rows = build_leaderboard_rows(
+            st.session_state.players_db, st.session_state.full_history_db,
+            st.session_state.inactivity_map, st.session_state.config
+        )
+        calc_report_pdf = generate_calculation_report_pdf(
+            st.session_state.config, st.session_state.quad_ranges, overview_rows, considered
+        )
+        st.download_button(
+            "Generate Report (PDF)",
+            data=calc_report_pdf,
+            file_name=f"{st.session_state.config['mode']}_calculation_report.pdf",
+            mime="application/pdf"
+        )
     else:
         st.info("Awaiting Configuration. Please initialize the selection window in the sidebar.")
 
@@ -1045,7 +1301,7 @@ with tabs[1]:
 
                 report_csv = generate_full_report_csv(filtered_rows, st.session_state.players_db, conf, conf['mode'])
 
-                export_col, push_col = st.columns(2)
+                export_col, push_col, pdf_col = st.columns(3)
                 with export_col:
                     st.download_button(
                         "Export Full Selection Report (CSV)",
@@ -1065,6 +1321,24 @@ with tabs[1]:
                                       "PythonAnywhere) and restart the app.")
                         except requests.exceptions.RequestException as e:
                             st.error(f"Upload failed: {e}")
+                with pdf_col:
+                    if st.button("Generate Report for All Players (PDF)"):
+                        with st.spinner("Building the PDF audit report for all players..."):
+                            st.session_state.all_players_pdf = generate_all_players_audit_pdf(
+                                rows, st.session_state.players_db, conf
+                            )
+                            st.session_state.all_players_pdf_mode = conf['mode']
+                        st.rerun()
+
+                if (st.session_state.get("all_players_pdf") is not None
+                        and st.session_state.get("all_players_pdf_mode") == conf['mode']):
+                    st.download_button(
+                        "Download All Players Audit Report (PDF)",
+                        data=st.session_state.all_players_pdf,
+                        file_name=f"{conf['mode']}_all_players_audit_report.pdf",
+                        mime="application/pdf",
+                        key="dl_all_players_pdf"
+                    )
     else:
         st.warning("Upload result files in the sidebar to generate rankings.")
 
@@ -1168,10 +1442,16 @@ with tabs[4]:
             else:
                 st.error("Incorrect password.")
     else:
-        top_col, refresh_col, lock_col = st.columns([4, 1, 1])
+        top_col, reset_col, refresh_col, lock_col = st.columns([3, 1, 1, 1])
         with top_col:
             st.caption(f"Browsing '{TOURNAMENT_ARCHIVE_DIR}/' - years newest-first, "
                        "tournaments within each year sorted latest-first.")
+        with reset_col:
+            if st.button("Reset Dataset", help="Clears the currently computed WAR results and "
+                                                "returns the dashboard to its initial state. "
+                                                "Doesn't touch any archive files."):
+                reset_dataset()
+                st.rerun()
         with refresh_col:
             if st.button("Refresh"):
                 st.rerun()
@@ -1199,6 +1479,12 @@ with tabs[4]:
             wsc_date = st.text_input(
                 "WSC International Event Date (DD.MM.YYYY)", value=event_date, key="dual_run_wsc_date"
             )
+            dual_run_ignore_q5 = st.checkbox(
+                "Ignore Q5 Push (Live View)", value=False, key="dual_run_ignore_q5",
+                help="Same as the sidebar's Live View toggle - skips the PDF p.3 push-back/merge "
+                     "rules and anchors Q5 to each cutoff date's natural quadrimester. Leave off "
+                     "for the official selection calculation."
+            )
             run_col, cancel_col = st.columns(2)
             with run_col:
                 if st.button("Confirm & Run", key="dual_run_confirm"):
@@ -1207,10 +1493,12 @@ with tabs[4]:
                         st.error("No parsable tournament files found in the archive.")
                     else:
                         wysc_bundle = process_tournament_data(
-                            st.session_state.engine, "WYSC", wysc_date, tournament_objects
+                            st.session_state.engine, "WYSC", wysc_date, tournament_objects,
+                            ignore_q5_push=dual_run_ignore_q5
                         )
                         wsc_bundle = process_tournament_data(
-                            st.session_state.engine, "WSC", wsc_date, tournament_objects
+                            st.session_state.engine, "WSC", wsc_date, tournament_objects,
+                            ignore_q5_push=dual_run_ignore_q5
                         )
                         if wysc_bundle:
                             st.session_state.results["WYSC"] = wysc_bundle
