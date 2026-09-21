@@ -1062,12 +1062,6 @@ if 'engine' not in st.session_state:
     st.session_state.results = {}
     st.session_state.active_mode = None
 
-with st.sidebar:
-    st.title("Administrative Panel")
-    st.caption("Getting started: open the **Tournament Archive** tab, unlock it, then click "
-               "**Run WAR for WYSC and WSC**. Manual/one-off file uploads live there too, under "
-               "'Advanced'.")
-
 # Main
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
