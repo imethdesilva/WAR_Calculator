@@ -127,28 +127,34 @@ class SelectionsEngine:
         if trailing_gap:
             return {
                 "status": "inactive",
-                "remark": f"Inactive - no tournaments played since {last_played:%Y-%m-%d} (>1 year). Ineligible for selection.",
+                "remark": (f"Inactive from {last_played:%Y-%m-%d} to the cutoff date "
+                           f"{cutoff_date:%Y-%m-%d} - no tournaments played in that span (>1 year). "
+                           f"Ineligible for selection."),
                 "override_ineligible": True,
                 "games_since_resumption": 0,
             }
 
         had_gap = resumption_idx > 0
         if had_gap:
+            gap_start = sorted_h[resumption_idx - 1]['date']
             resumption_date = sorted_h[resumption_idx]['date']
             games_since = sum(h['games'] for h in sorted_h[resumption_idx:] if not h.get('provisional'))
             if games_since < 50:
                 remaining = 50 - games_since
                 return {
                     "status": "resuming",
-                    "remark": (f"Inactive for more than a year before {resumption_date:%Y-%m-%d}. "
-                               f"WAR considered only after 50 games played since activeness "
-                               f"({games_since}/50 played, {remaining} more needed). Ineligible until then."),
+                    "remark": (f"Was inactive from {gap_start:%Y-%m-%d} to {resumption_date:%Y-%m-%d} "
+                               f"(>1 year gap). WAR considered only after 50 games played since "
+                               f"resumption ({games_since}/50 played, {remaining} more needed). "
+                               f"Ineligible until then."),
                     "override_ineligible": True,
                     "games_since_resumption": games_since,
                 }
             return {
                 "status": "cleared",
-                "remark": f"Previously inactive (gap ending {resumption_date:%Y-%m-%d}); {games_since} games played since resumption - restriction cleared.",
+                "remark": (f"Was inactive from {gap_start:%Y-%m-%d} to {resumption_date:%Y-%m-%d} "
+                           f"(>1 year gap); {games_since} games played since resumption - "
+                           f"restriction cleared, normal eligibility criteria apply."),
                 "override_ineligible": False,
                 "games_since_resumption": games_since,
             }
@@ -306,6 +312,47 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
     return rows
 
 
+def build_eligibility_reasons(row, conf):
+    """Explains, in plain language, exactly why a player qualified or fell short -
+    every threshold that wasn't met, by how much, plus the inactivity remark (if
+    any) from detect_inactivity. Used in the all-players PDF audit so a reader
+    doesn't have to reverse-engineer the numbers themselves."""
+    if row["Total Games"] == 0 and row["Tournaments"] == 0:
+        return [row["Remarks"] or "No qualifying (non-provisional, in-window) tournament results found."]
+
+    reasons = []
+    if row["Remarks"]:
+        reasons.append(row["Remarks"])
+
+    shortfalls = []
+    if row["WAR"] < conf['min_war']:
+        shortfalls.append(f"WAR of {row['WAR']} is below the minimum required {conf['min_war']}.")
+    if row["Total Games"] < conf['req_games']:
+        shortfalls.append(f"Played {row['Total Games']} rated game(s), short of the required "
+                           f"{conf['req_games']}+ by {conf['req_games'] - row['Total Games']}.")
+    if row["Tournaments"] < conf['req_tours']:
+        shortfalls.append(f"Played {row['Tournaments']} tournament(s), short of the required "
+                           f"{conf['req_tours']}+ by {conf['req_tours'] - row['Tournaments']}.")
+    if row["Quads"] < conf['min_quads']:
+        shortfalls.append(f"Played in {row['Quads']} distinct quadrimester(s), short of the "
+                           f"required {conf['min_quads']}+ by {conf['min_quads'] - row['Quads']}.")
+    if row["Majors"] < 1:
+        shortfalls.append("Did not play a qualifying 18-round major tournament.")
+    if row["Recent"] < conf['req_recent']:
+        shortfalls.append(f"Played {row['Recent']} tournament(s) in the most recent quadrimester(s) "
+                           f"(Q4/Q5), short of the required {conf['req_recent']}+ by "
+                           f"{conf['req_recent'] - row['Recent']}.")
+
+    if shortfalls:
+        reasons.extend(shortfalls)
+    else:
+        suffix = " (otherwise)." if reasons else "."
+        reasons.append("Meets all WAR, games, tournament, quadrimester, major, and "
+                        "recent-activity requirements" + suffix)
+
+    return reasons
+
+
 def build_considered_tournaments_table(players_db):
     """Lists every distinct tournament actually counted toward WAR for this mode -
     i.e. one that matched a quadrimester and had at least one non-provisional result.
@@ -355,6 +402,7 @@ def find_similar_player_names(names, ratio_threshold=0.85):
 
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
+DEFAULT_EVENT_DATE = "15.10.2025"
 
 
 def _read_archive_file(fpath):
@@ -730,12 +778,10 @@ def push_csv_to_pythonanywhere(csv_text, filename):
     response.raise_for_status()
 
 
-PDF_NAVY = colors.HexColor("#004a99")
-PDF_LIGHT_ROW = colors.HexColor("#f2f6fb")
-PDF_BORDER = colors.HexColor("#c9c9c9")
-PDF_GREEN = colors.HexColor("#1e7e34")
-PDF_RED = colors.HexColor("#b02a37")
-PDF_AMBER = colors.HexColor("#8a6d00")
+PDF_HEADER_BG = colors.HexColor("#1a1a1a")
+PDF_LIGHT_ROW = colors.HexColor("#f0f0f0")
+PDF_BORDER = colors.HexColor("#555555")
+PDF_GREY_TEXT = colors.HexColor("#555555")
 
 _PDF_CELL_STYLE = ParagraphStyle(
     "PdfCell", fontName="Helvetica", fontSize=8, leading=10, alignment=TA_CENTER
@@ -753,29 +799,34 @@ def _pdf_cell(text):
 def _pdf_styles():
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
-        name="ReportTitle", parent=styles["Title"], textColor=PDF_NAVY, fontSize=19, spaceAfter=4
+        name="ReportTitle", parent=styles["Title"], textColor=colors.black, fontSize=19, spaceAfter=4
     ))
     styles.add(ParagraphStyle(
-        name="ReportSubtitle", parent=styles["Normal"], textColor=colors.grey, fontSize=9, spaceAfter=12
+        name="ReportSubtitle", parent=styles["Normal"], textColor=PDF_GREY_TEXT, fontSize=9, spaceAfter=12
     ))
     styles.add(ParagraphStyle(
-        name="SectionHeading", parent=styles["Heading2"], textColor=PDF_NAVY, fontSize=13,
+        name="SectionHeading", parent=styles["Heading2"], textColor=colors.black, fontSize=13,
         spaceBefore=14, spaceAfter=6
     ))
     styles.add(ParagraphStyle(
-        name="PlayerHeading", parent=styles["Heading3"], textColor=PDF_NAVY, fontSize=11.5,
+        name="PlayerHeading", parent=styles["Heading3"], textColor=colors.black, fontSize=11.5,
         spaceBefore=10, spaceAfter=2
     ))
     styles.add(ParagraphStyle(name="BodySmall", parent=styles["Normal"], fontSize=8.5, leading=11))
+    styles.add(ParagraphStyle(
+        name="ReasonLine", parent=styles["Normal"], fontSize=8.5, leading=11, leftIndent=10,
+        bulletIndent=0
+    ))
     return styles
 
 
 def _pdf_table(data, col_widths=None):
-    """Shared 'house style' for every data table in both reports: navy header row,
-    alternating light-blue body rows, thin grey gridlines, centered small text."""
+    """Shared 'house style' for every data table in both reports: black header row,
+    alternating light-grey body rows, thin grey gridlines, centered small text -
+    plain black-and-white throughout, no colour."""
     table = Table(data, colWidths=col_widths, repeatRows=1)
     style = [
-        ('BACKGROUND', (0, 0), (-1, 0), PDF_NAVY),
+        ('BACKGROUND', (0, 0), (-1, 0), PDF_HEADER_BG),
         ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
         ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
         ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
@@ -795,7 +846,7 @@ def _pdf_table(data, col_widths=None):
 def _pdf_header(story, styles, title, subtitle):
     story.append(Paragraph(xml_escape(title), styles["ReportTitle"]))
     story.append(Paragraph(xml_escape(subtitle), styles["ReportSubtitle"]))
-    story.append(HRFlowable(width="100%", color=PDF_NAVY, thickness=1.2, spaceAfter=12))
+    story.append(HRFlowable(width="100%", color=colors.black, thickness=1.2, spaceAfter=12))
 
 
 def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tournaments):
@@ -837,7 +888,6 @@ def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tourname
         ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
         ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
         ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('TEXTCOLOR', (0, 0), (0, -1), PDF_NAVY),
         ('GRID', (0, 0), (-1, -1), 0.4, PDF_BORDER),
         ('BACKGROUND', (0, 0), (0, -1), PDF_LIGHT_ROW),
         ('TOPPADDING', (0, 0), (-1, -1), 5),
@@ -882,9 +932,12 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
         title=f"{conf['mode']} Individual Player Audits"
     )
     styles = _pdf_styles()
-    status_style_qualified = ParagraphStyle("StatusQ", parent=styles["BodySmall"], textColor=PDF_GREEN, spaceAfter=4)
-    status_style_ineligible = ParagraphStyle("StatusI", parent=styles["BodySmall"], textColor=PDF_RED, spaceAfter=4)
-    remark_style = ParagraphStyle("Remark", parent=styles["BodySmall"], textColor=PDF_AMBER, spaceBefore=3)
+    status_style = ParagraphStyle(
+        "StatusLine", parent=styles["BodySmall"], fontName="Helvetica-Bold", spaceAfter=4
+    )
+    reason_label_style = ParagraphStyle(
+        "ReasonLabel", parent=styles["BodySmall"], fontName="Helvetica-Bold", spaceBefore=3, spaceAfter=1
+    )
     story = []
 
     _pdf_header(
@@ -897,7 +950,6 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
         name = row["Player Name"]
 
         story.append(Paragraph(f"{idx}. {xml_escape(name)}", styles["PlayerHeading"]))
-        status_style = status_style_qualified if row["Status"] == "QUALIFIED" else status_style_ineligible
         story.append(Paragraph(f"WAR: {row['WAR']}  |  Status: {row['Status']}", status_style))
 
         summary_data = [
@@ -937,8 +989,10 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
                 "No qualifying (non-provisional, in-window) tournament history found.", styles["BodySmall"]
             ))
 
-        if row["Remarks"]:
-            story.append(Paragraph(f"Remark: {xml_escape(row['Remarks'])}", remark_style))
+        reasons = build_eligibility_reasons(row, conf)
+        story.append(Paragraph("Reasons:", reason_label_style))
+        for reason in reasons:
+            story.append(Paragraph(f"- {xml_escape(reason)}", styles["ReasonLine"]))
 
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", color=PDF_BORDER, thickness=0.5, spaceAfter=8))
@@ -1010,72 +1064,19 @@ if 'engine' not in st.session_state:
 
 with st.sidebar:
     st.title("Administrative Panel")
-    selected_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"])
-    event_date = st.text_input("International Event Date (DD.MM.YYYY)", value="15.10.2025")
-    ignore_q5_push = st.toggle(
-        "Ignore Q5 Push (Live View)",
-        value=False,
-        help="Official selection rules push Q5 back a full quadrimester when it's still empty "
-             "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
-             "quadrimester, so you can watch live WAR update as new results come in, ahead of "
-             "the official cutoff determination."
-    )
-
-    if st.button("Initialize Selection Window"):
-        # Reuse whatever tournament dates are already known (from a prior file
-        # upload) so this preview doesn't wrongly assume "no tournaments yet"
-        # and push Q5 back a full quadrimester when real data says otherwise.
-        config, quads = st.session_state.engine.calculate_configuration(
-            selected_mode, event_date,
-            tournament_dates=st.session_state.uploaded_tournament_dates,
-            ignore_q5_push=ignore_q5_push
-        )
-        if config:
-            st.session_state.config = config
-            st.session_state.quad_ranges = quads
-            if ignore_q5_push:
-                st.warning("Live View active: Q5 push-back rule is disabled. This is for monitoring "
-                           "current-form WAR only, not for official selection determinations.")
-            elif not st.session_state.uploaded_tournament_dates:
-                st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed empty per the PDF's "
-                        "'no tournament held' rule until you upload and process real results.")
-            st.success("Configuration Validated")
-
-    st.markdown("---")
-    st.subheader("Data Ingestion")
-    uploaded_files = st.file_uploader("Upload Tournament Files (.txt)", accept_multiple_files=True)
-
-    if uploaded_files:
-        if st.button("Process Tournament Results"):
-
-            parsed_tournament_objects = []
-            for f in uploaded_files:
-                content = f.read().decode('utf-8', errors='ignore')
-                data = st.session_state.engine.parse_tournament_file(content)
-                if data:
-                    data['source_filename'] = f.name
-                    parsed_tournament_objects.append(data)
-
-            if not parsed_tournament_objects:
-                st.error("No valid tournament data found in uploaded files.")
-                st.stop()
-
-            bundle = process_tournament_data(
-                st.session_state.engine, selected_mode, event_date,
-                parsed_tournament_objects, ignore_q5_push=ignore_q5_push
-            )
-
-            if bundle:
-                st.session_state.results[selected_mode] = bundle
-                sync_active_dataset(selected_mode)
-                st.success("Calculated WAR using Seasonal Calendar Weights")
-                st.rerun()
+    st.caption("Getting started: open the **Tournament Archive** tab, unlock it, then click "
+               "**Run WAR for WYSC and WSC**. Manual/one-off file uploads live there too, under "
+               "'Advanced'.")
 
 # Main
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
-if len(st.session_state.results) > 1:
+if not st.session_state.active_mode:
+    st.info("**Getting started:** open the **Tournament Archive** tab below, unlock it with the "
+            "archive password, then click **Run WAR for WYSC and WSC**. Once that finishes, "
+            "results appear in Selection Overview and National Leaderboard.")
+elif len(st.session_state.results) > 1:
     cached_modes = list(st.session_state.results.keys())
     current_idx = cached_modes.index(st.session_state.active_mode) if st.session_state.active_mode in cached_modes else 0
     viewing_mode = st.radio(
@@ -1086,12 +1087,14 @@ if len(st.session_state.results) > 1:
     if viewing_mode != st.session_state.active_mode:
         sync_active_dataset(viewing_mode)
         st.rerun()
+else:
+    st.caption(f"Viewing dataset: **{st.session_state.active_mode}**")
 
-tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria",
-                "Tournament Archive", "Tournament History"])
+tabs = st.tabs(["Tournament Archive", "Selection Overview", "National Leaderboard",
+                "Individual Player Audit", "Policy & Criteria"])
 
 # Overview
-with tabs[0]:
+with tabs[1]:
     if 'config' in st.session_state:
         if st.session_state.config.get('ignore_q5_push'):
             st.warning("LIVE VIEW - Q5 push-back rule is disabled. Quadrimesters are anchored to "
@@ -1141,7 +1144,7 @@ with tabs[0]:
         st.info("Awaiting Configuration. Please initialize the selection window in the sidebar.")
 
 # Leaderboard
-with tabs[1]:
+with tabs[2]:
     if st.session_state.processed_files:
         conf = st.session_state.config
         rows = build_leaderboard_rows(
@@ -1249,7 +1252,7 @@ with tabs[1]:
 
             filter_col1, filter_col2 = st.columns(2)
             with filter_col1:
-                hide_zero_war = st.checkbox("Hide players with WAR = 0", value=False)
+                hide_zero_war = st.checkbox("Hide players with WAR = 0", value=True)
             with filter_col2:
                 hide_inactive = st.checkbox(
                     "Hide inactive players (no tournaments in >1 year)",
@@ -1340,10 +1343,10 @@ with tabs[1]:
                         key="dl_all_players_pdf"
                     )
     else:
-        st.warning("Upload result files in the sidebar to generate rankings.")
+        st.warning("Run WAR from the Tournament Archive tab to generate rankings.")
 
 # Player Breakdown
-with tabs[2]:
+with tabs[3]:
     if st.session_state.processed_files:
         player_select = st.selectbox("Search Player for Audit", sorted(st.session_state.players_db.keys()))
         if player_select:
@@ -1396,7 +1399,7 @@ with tabs[2]:
         st.info("Awaiting data processing.")
 
 # Info
-with tabs[3]:
+with tabs[4]:
     st.header("National Selection Policy Summary")
     
     st.subheader("World Scrabble Championship (WSC) Selection Criteria")
@@ -1427,7 +1430,7 @@ with tabs[3]:
     st.link_button("Read about the National Scrabble Selections Process on Medium", "https://medium.com/@imethdesilva/weighted-ratings-and-the-national-scrabble-selections-process-567231d9c486")
 
 # Tournament Archive
-with tabs[4]:
+with tabs[0]:
     st.header("Tournament File Archive")
 
     if not ARCHIVE_PASSWORD:
@@ -1474,14 +1477,14 @@ with tabs[4]:
 
         if st.session_state.get("show_dual_run_form"):
             wysc_date = st.text_input(
-                "WYSC International Event Date (DD.MM.YYYY)", value=event_date, key="dual_run_wysc_date"
+                "WYSC International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="dual_run_wysc_date"
             )
             wsc_date = st.text_input(
-                "WSC International Event Date (DD.MM.YYYY)", value=event_date, key="dual_run_wsc_date"
+                "WSC International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="dual_run_wsc_date"
             )
             dual_run_ignore_q5 = st.checkbox(
                 "Ignore Q5 Push (Live View)", value=False, key="dual_run_ignore_q5",
-                help="Same as the sidebar's Live View toggle - skips the PDF p.3 push-back/merge "
+                help="Skips the PDF p.3 push-back/merge "
                      "rules and anchors Q5 to each cutoff date's natural quadrimester. Leave off "
                      "for the official selection calculation."
             )
@@ -1529,21 +1532,73 @@ with tabs[4]:
                 st.rerun()
 
         st.markdown("---")
+        with st.expander("Advanced: Manual / One-off Upload"):
+            st.caption("For testing a single mode against a handful of files outside the archive, "
+                       "instead of the full archive-wide run above.")
+            manual_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"], key="manual_mode")
+            manual_event_date = st.text_input(
+                "International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="manual_event_date"
+            )
+            manual_ignore_q5 = st.toggle(
+                "Ignore Q5 Push (Live View)", value=False, key="manual_ignore_q5",
+                help="Official selection rules push Q5 back a full quadrimester when it's still empty "
+                     "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
+                     "quadrimester, so you can watch live WAR update as new results come in, ahead of "
+                     "the official cutoff determination."
+            )
+
+            if st.button("Initialize Selection Window (Preview)", key="manual_init_window"):
+                config, quads = st.session_state.engine.calculate_configuration(
+                    manual_mode, manual_event_date,
+                    tournament_dates=st.session_state.uploaded_tournament_dates,
+                    ignore_q5_push=manual_ignore_q5
+                )
+                if config:
+                    st.session_state.config = config
+                    st.session_state.quad_ranges = quads
+                    if manual_ignore_q5:
+                        st.warning("Live View active: Q5 push-back rule is disabled. This is for "
+                                   "monitoring current-form WAR only, not official selection.")
+                    elif not st.session_state.uploaded_tournament_dates:
+                        st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed "
+                                "empty per the PDF's 'no tournament held' rule until real results "
+                                "are processed.")
+                    st.success("Configuration Validated")
+
+            manual_uploaded_files = st.file_uploader(
+                "Upload Tournament Files (.txt)", accept_multiple_files=True, key="manual_uploader"
+            )
+            if manual_uploaded_files and st.button("Process Tournament Results", key="manual_process"):
+                parsed_tournament_objects = []
+                for f in manual_uploaded_files:
+                    content = f.read().decode('utf-8', errors='ignore')
+                    data = st.session_state.engine.parse_tournament_file(content)
+                    if data:
+                        data['source_filename'] = f.name
+                        parsed_tournament_objects.append(data)
+
+                if not parsed_tournament_objects:
+                    st.error("No valid tournament data found in uploaded files.")
+                else:
+                    bundle = process_tournament_data(
+                        st.session_state.engine, manual_mode, manual_event_date,
+                        parsed_tournament_objects, ignore_q5_push=manual_ignore_q5
+                    )
+                    if bundle:
+                        st.session_state.results[manual_mode] = bundle
+                        sync_active_dataset(manual_mode)
+                        st.success("Calculated WAR using Seasonal Calendar Weights")
+                        st.rerun()
+
         with st.expander("Add Tournament File"):
-            st.caption("Requires the archive password again to confirm, since this writes a "
-                       "new file directly into the archive folder on disk.")
+            st.caption("Writes a new file directly into the archive folder on disk.")
             add_year = st.text_input(
                 "Year folder (e.g. 2026 - created if it doesn't exist)", key="add_file_year"
             )
             add_fname = st.text_input("File name (e.g. MyTournament.txt)", key="add_file_name")
             add_content = st.text_area("File contents", height=200, key="add_file_content")
-            add_pwd = st.text_input(
-                "Re-enter archive password to confirm", type="password", key="add_file_pwd"
-            )
             if st.button("Add File", key="add_file_btn"):
-                if add_pwd != ARCHIVE_PASSWORD:
-                    st.error("Incorrect password.")
-                elif not add_year.strip() or not add_fname.strip():
+                if not add_year.strip() or not add_fname.strip():
                     st.error("Enter both a year folder and a file name.")
                 elif not add_fname.strip().lower().endswith(".txt"):
                     st.error("File name must end in .txt")
@@ -1568,8 +1623,8 @@ with tabs[4]:
             st.warning(f"No archive found. Expected year subfolders (e.g. '2024', '2025') under "
                        f"'{TOURNAMENT_ARCHIVE_DIR}/' next to main.py.")
         else:
-            year_tabs = st.tabs([year for year, _ in structure])
-            for year_tab, (year, files) in zip(year_tabs, structure):
+            year_tabs = st.tabs([year for year, _ in structure] + ["All Tournaments"])
+            for year_tab, (year, files) in zip(year_tabs[:-1], structure):
                 with year_tab:
                     if not files:
                         st.caption("No files in this folder.")
@@ -1714,18 +1769,15 @@ with tabs[4]:
                                         st.session_state[confirm_key] = False
                                         st.rerun()
 
-# Tournament History
-with tabs[5]:
-    st.header("Tournament History")
-    st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', latest first.")
-
-    history_rows = build_tournament_history(st.session_state.engine)
-    if not history_rows:
-        st.warning(f"No tournament files found under '{TOURNAMENT_ARCHIVE_DIR}/'.")
-    else:
-        hist_df = pd.DataFrame(history_rows)
-        hist_df['Date'] = hist_df['Date'].dt.strftime('%Y-%m-%d')
-        hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
-        year_count = len(get_archive_structure(st.session_state.engine))
-        st.caption(f"{len(history_rows)} tournaments found across {year_count} year folder(s).")
+            with year_tabs[-1]:
+                st.subheader("All Tournaments (Latest First)")
+                st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', across all years.")
+                history_rows = build_tournament_history(st.session_state.engine)
+                if not history_rows:
+                    st.warning(f"No tournament files found under '{TOURNAMENT_ARCHIVE_DIR}/'.")
+                else:
+                    hist_df = pd.DataFrame(history_rows)
+                    hist_df['Date'] = hist_df['Date'].dt.strftime('%Y-%m-%d')
+                    hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
+                    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+                    st.caption(f"{len(history_rows)} tournaments found across {len(structure)} year folder(s).")
