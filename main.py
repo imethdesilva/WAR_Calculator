@@ -297,6 +297,31 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
     return rows
 
 
+def build_considered_tournaments_table(players_db):
+    """Lists every distinct tournament actually counted toward WAR for this mode -
+    i.e. one that matched a quadrimester and had at least one non-provisional result.
+    Derived from players_db history entries (already filtered to in-window,
+    non-provisional results) and deduped, since every player who played it repeats
+    the same tournament/date/quad/weight."""
+    seen = {}
+    for pdata in players_db.values():
+        for h in pdata['history']:
+            key = (h['Tournament'], h['Date'], h['Quad'])
+            if key not in seen:
+                seen[key] = {
+                    "Tournament": h['Tournament'],
+                    "Date": h['Date'],
+                    "Quadrimester": h['Quad'],
+                    "Weight Factor": h['Weight'],
+                    "Players Considered": 0,
+                }
+            seen[key]["Players Considered"] += 1
+
+    rows = list(seen.values())
+    rows.sort(key=lambda r: r["Date"])
+    return rows
+
+
 def find_similar_player_names(names, ratio_threshold=0.85):
     """Flags likely-duplicate player names so an admin can catch a typo or inconsistent
     spelling before it silently fragments one person's results across two 'players' -
@@ -843,6 +868,19 @@ with tabs[0]:
         q_df['start'] = q_df['start'].dt.strftime('%Y-%m-%d')
         q_df['end'] = q_df['end'].dt.strftime('%Y-%m-%d')
         st.table(q_df[['quad', 'weight', 'start', 'end']].rename(columns={'quad': 'Period', 'weight': 'Weight Factor'}))
+
+        st.subheader(f"Tournaments Considered for WAR ({st.session_state.config['mode']})")
+        considered = build_considered_tournaments_table(st.session_state.players_db)
+        if not considered:
+            st.info("No tournaments have been included yet - process files in the sidebar or run "
+                    "the archive-wide WAR calculation first.")
+        else:
+            considered_df = pd.DataFrame(considered)
+            considered_df.insert(0, "No.", range(1, len(considered_df) + 1))
+            st.dataframe(considered_df, use_container_width=True, hide_index=True)
+            st.caption(f"{len(considered)} tournament(s) fell within a quadrimester and contributed "
+                       f"to WAR for {st.session_state.config['mode']}. Tournaments outside the 20-month "
+                       f"window, or with only provisional results, are omitted from this list.")
     else:
         st.info("Awaiting Configuration. Please initialize the selection window in the sidebar.")
 
