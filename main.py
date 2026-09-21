@@ -466,6 +466,152 @@ def rename_player_across_archive(engine, old_names, new_name, base_dir=TOURNAMEN
     return changed
 
 
+def process_tournament_data(engine, mode, event_date_str, tournament_objects, ignore_q5_push=False):
+    """Runs the full WAR pipeline (quad/cutoff calculation, per-player history build,
+    inactivity detection) for one mode over a pool of already-parsed tournament objects,
+    exactly like the sidebar's manual upload flow. Shared so both that flow and the
+    archive-wide 'Run WAR for WYSC and WSC' button use identical logic instead of two
+    copies drifting apart. Returns a result bundle dict, or None if tournament_objects
+    is empty or the configuration failed (calculate_configuration already st.error's on
+    a bad date)."""
+    all_tour_dates = [t['date'] for t in tournament_objects]
+    if not all_tour_dates:
+        return None
+
+    upload_warnings = {}
+    for t in tournament_objects:
+        if t.get('warnings'):
+            upload_warnings[t.get('source_filename', t['name'])] = t['warnings']
+
+    config, quads = engine.calculate_configuration(
+        mode, event_date_str, tournament_dates=all_tour_dates, ignore_q5_push=ignore_q5_push
+    )
+    if not config:
+        return None
+
+    db = {}
+    # Every detectable player across ALL files, any date, provisional or not - used
+    # only to detect >1yr inactivity gaps (PDF p.6), never for WAR math.
+    full_history = {}
+
+    for data in tournament_objects:
+        q_info = next((q for q in quads if q['start'] <= data['date'] <= q['end']), None)
+
+        file_summary = {}
+        for p in data['players']:
+            name = p['name']
+            if name not in file_summary:
+                file_summary[name] = {
+                    "games": 0, "old": p['old_rating'], "new": p['new_rating'],
+                    "provisional": p.get('provisional', False)
+                }
+            file_summary[name]["games"] += p['games']
+            file_summary[name]["new"] = p['new_rating']
+            file_summary[name]["provisional"] = p.get('provisional', False)
+
+        for name, p_file_data in file_summary.items():
+            full_history.setdefault(name, []).append({
+                "date": data['date'],
+                "games": p_file_data['games'],
+                "provisional": p_file_data['provisional']
+            })
+
+            # PDF p.2: provisional-rated results are excluded from WAR entirely.
+            if p_file_data['provisional']:
+                continue
+            # Outside every quadrimester's date range (e.g. older than the 20-month
+            # window, or in a gap the p.3 push-back/merge rules excluded) - omitted.
+            if not q_info:
+                continue
+
+            if name not in db:
+                db[name] = {
+                    "history": [], "total_games": 0, "tournaments": 0,
+                    "quads": set(), "major_count": 0, "recent_count": 0,
+                    "current_rating": 0, "latest_rating_date": datetime(1900, 1, 1)
+                }
+
+            db[name]["history"].append({
+                "Date": data['date'].strftime('%Y-%m-%d'),
+                "Tournament": data['name'],
+                "Quad": q_info['quad'],
+                "Weight": q_info['weight'],
+                "Old Rating": p_file_data['old'],
+                "New Rating": p_file_data['new'],
+                "WeightedVal": p_file_data['new'] * q_info['weight'],
+                "Games": p_file_data['games']
+            })
+
+            db[name]["total_games"] += p_file_data['games']
+            db[name]["tournaments"] += 1
+            db[name]["quads"].add(q_info['quad'])
+
+            if data['date'] >= db[name]["latest_rating_date"]:
+                db[name]["latest_rating_date"] = data['date']
+                db[name]["current_rating"] = p_file_data['new']
+
+            # PDF p.5: the candidate must have personally played the full 18 rounds -
+            # a file-wide "this tournament had an 18-round division somewhere" flag
+            # is not enough if the player was in a shorter one.
+            if p_file_data['games'] >= 18:
+                db[name]["major_count"] += 1
+
+            if q_info['quad'] >= 4:
+                db[name]["recent_count"] += 1
+
+    inactivity_map = {
+        name: engine.detect_inactivity(hist, config['cutoff_date'])
+        for name, hist in full_history.items()
+    }
+
+    return {
+        "config": config,
+        "quad_ranges": quads,
+        "players_db": db,
+        "full_history_db": full_history,
+        "inactivity_map": inactivity_map,
+        "uploaded_tournament_dates": all_tour_dates,
+        "upload_warnings": upload_warnings,
+    }
+
+
+def load_all_archive_tournament_objects(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Parses every .txt file across every year folder in the archive into a flat pool
+    of tournament objects, tagged with their source filename for warning attribution.
+    This is the pool the 'Run WAR for WYSC and WSC' button feeds into
+    process_tournament_data() for each mode - the same quad/date matching in that
+    function then naturally omits whichever files fall outside a given mode's window."""
+    objects = []
+    for year, files in get_archive_structure(engine, base_dir):
+        for fname in files:
+            content = _read_archive_file(os.path.join(base_dir, year, fname))
+            if content is None:
+                continue
+            data = engine.parse_tournament_file(content)
+            if data:
+                data['source_filename'] = f"{fname} ({year})"
+                objects.append(data)
+    return objects
+
+
+def sync_active_dataset(mode):
+    """Copies a cached result bundle from st.session_state.results[mode] into the flat
+    session-state variables the Overview/Leaderboard/Player Audit tabs read, so
+    switching between a cached WSC and WYSC run doesn't require recomputation."""
+    bundle = st.session_state.results.get(mode)
+    if not bundle:
+        return
+    st.session_state.config = bundle["config"]
+    st.session_state.quad_ranges = bundle["quad_ranges"]
+    st.session_state.players_db = bundle["players_db"]
+    st.session_state.full_history_db = bundle["full_history_db"]
+    st.session_state.inactivity_map = bundle["inactivity_map"]
+    st.session_state.uploaded_tournament_dates = bundle["uploaded_tournament_dates"]
+    st.session_state.upload_warnings = bundle["upload_warnings"]
+    st.session_state.processed_files = True
+    st.session_state.active_mode = mode
+
+
 def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf = io.StringIO()
     headers_map = threshold_headers(conf)
@@ -592,6 +738,8 @@ if 'engine' not in st.session_state:
     st.session_state.uploaded_tournament_dates = []
     st.session_state.upload_warnings = {}
     st.session_state.archive_unlocked = False
+    st.session_state.results = {}
+    st.session_state.active_mode = None
 
 with st.sidebar:
     st.title("Administrative Panel")
@@ -633,121 +781,44 @@ with st.sidebar:
     if uploaded_files:
         if st.button("Process Tournament Results"):
 
-            all_tour_dates = []
             parsed_tournament_objects = []
-            upload_warnings = {}
-
             for f in uploaded_files:
                 content = f.read().decode('utf-8', errors='ignore')
                 data = st.session_state.engine.parse_tournament_file(content)
                 if data:
-                    all_tour_dates.append(data['date'])
+                    data['source_filename'] = f.name
                     parsed_tournament_objects.append(data)
-                    if data.get('warnings'):
-                        upload_warnings[f.name] = data['warnings']
 
-            if not all_tour_dates:
+            if not parsed_tournament_objects:
                 st.error("No valid tournament data found in uploaded files.")
                 st.stop()
 
-            config, quads = st.session_state.engine.calculate_configuration(
-                selected_mode,
-                event_date,
-                tournament_dates=all_tour_dates,
-                ignore_q5_push=ignore_q5_push
+            bundle = process_tournament_data(
+                st.session_state.engine, selected_mode, event_date,
+                parsed_tournament_objects, ignore_q5_push=ignore_q5_push
             )
 
-            if config:
-                st.session_state.config = config
-                st.session_state.quad_ranges = quads
-
-                db = {}
-                # Every detectable player across ALL uploaded files, any date, provisional
-                # or not - used only to detect >1yr inactivity gaps (PDF p.6), never for WAR math.
-                full_history = {}
-
-                for data in parsed_tournament_objects:
-
-                    q_info = next((q for q in st.session_state.quad_ranges
-                                 if q['start'] <= data['date'] <= q['end']), None)
-
-                    file_summary = {}
-                    for p in data['players']:
-                        name = p['name']
-                        if name not in file_summary:
-                            file_summary[name] = {
-                                "games": 0, "old": p['old_rating'], "new": p['new_rating'],
-                                "provisional": p.get('provisional', False)
-                            }
-                        file_summary[name]["games"] += p['games']
-                        file_summary[name]["new"] = p['new_rating']
-                        file_summary[name]["provisional"] = p.get('provisional', False)
-
-                    for name, p_file_data in file_summary.items():
-                        full_history.setdefault(name, []).append({
-                            "date": data['date'],
-                            "games": p_file_data['games'],
-                            "provisional": p_file_data['provisional']
-                        })
-
-                        # PDF p.2: provisional-rated results are excluded from WAR entirely.
-                        if p_file_data['provisional']:
-                            continue
-                        if not q_info:
-                            continue
-
-                        if name not in db:
-                            db[name] = {
-                                "history": [], "total_games": 0, "tournaments": 0,
-                                "quads": set(), "major_count": 0, "recent_count": 0,
-                                "current_rating": 0, "latest_rating_date": datetime(1900, 1, 1)
-                            }
-
-                        db[name]["history"].append({
-                            "Date": data['date'].strftime('%Y-%m-%d'),
-                            "Tournament": data['name'],
-                            "Quad": q_info['quad'],
-                            "Weight": q_info['weight'],
-                            "Old Rating": p_file_data['old'],
-                            "New Rating": p_file_data['new'],
-                            "WeightedVal": p_file_data['new'] * q_info['weight'],
-                            "Games": p_file_data['games']
-                        })
-
-                        db[name]["total_games"] += p_file_data['games']
-                        db[name]["tournaments"] += 1
-                        db[name]["quads"].add(q_info['quad'])
-
-                        if data['date'] >= db[name]["latest_rating_date"]:
-                            db[name]["latest_rating_date"] = data['date']
-                            db[name]["current_rating"] = p_file_data['new']
-
-                        # PDF p.5: the candidate must have personally played the full 18
-                        # rounds - a file-wide "this tournament had an 18-round division
-                        # somewhere" flag is not enough if the player was in a shorter one.
-                        if p_file_data['games'] >= 18:
-                            db[name]["major_count"] += 1
-
-                        if q_info['quad'] >= 4:
-                            db[name]["recent_count"] += 1
-
-                inactivity_map = {
-                    name: st.session_state.engine.detect_inactivity(hist, config['cutoff_date'])
-                    for name, hist in full_history.items()
-                }
-
-                st.session_state.players_db = db
-                st.session_state.full_history_db = full_history
-                st.session_state.inactivity_map = inactivity_map
-                st.session_state.uploaded_tournament_dates = all_tour_dates
-                st.session_state.upload_warnings = upload_warnings
-                st.session_state.processed_files = True
+            if bundle:
+                st.session_state.results[selected_mode] = bundle
+                sync_active_dataset(selected_mode)
                 st.success("Calculated WAR using Seasonal Calendar Weights")
                 st.rerun()
 
 # Main
 st.title("National Scrabble Selections - WAR Calculator")
 st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
+
+if len(st.session_state.results) > 1:
+    cached_modes = list(st.session_state.results.keys())
+    current_idx = cached_modes.index(st.session_state.active_mode) if st.session_state.active_mode in cached_modes else 0
+    viewing_mode = st.radio(
+        "Viewing dataset", cached_modes, index=current_idx, horizontal=True,
+        help="Both WSC and WYSC results are cached from the last run - switch between "
+             "them instantly without reprocessing."
+    )
+    if viewing_mode != st.session_state.active_mode:
+        sync_active_dataset(viewing_mode)
+        st.rerun()
 
 tabs = st.tabs(["Selection Overview", "National Leaderboard", "Individual Player Audit", "Policy & Criteria",
                 "Tournament Archive", "Tournament History"])
@@ -1071,6 +1142,101 @@ with tabs[4]:
                 st.session_state.archive_unlocked = False
                 st.rerun()
 
+        st.markdown("---")
+        st.subheader("Run WAR for WYSC and WSC")
+        st.caption("Runs the full WAR calculation for both classifications using every file "
+                   "in this archive across all years - files outside a classification's "
+                   "quadrimester window are automatically excluded, exactly like a normal "
+                   "run. Results are cached so you can switch between them from the "
+                   "'Viewing dataset' control at the top of the page without reprocessing.")
+
+        if st.button("Run WAR for WYSC and WSC", key="dual_run_trigger"):
+            st.session_state.show_dual_run_form = True
+            st.rerun()
+
+        if st.session_state.get("show_dual_run_form"):
+            wysc_date = st.text_input(
+                "WYSC International Event Date (DD.MM.YYYY)", value=event_date, key="dual_run_wysc_date"
+            )
+            wsc_date = st.text_input(
+                "WSC International Event Date (DD.MM.YYYY)", value=event_date, key="dual_run_wsc_date"
+            )
+            run_col, cancel_col = st.columns(2)
+            with run_col:
+                if st.button("Confirm & Run", key="dual_run_confirm"):
+                    tournament_objects = load_all_archive_tournament_objects(st.session_state.engine)
+                    if not tournament_objects:
+                        st.error("No parsable tournament files found in the archive.")
+                    else:
+                        wysc_bundle = process_tournament_data(
+                            st.session_state.engine, "WYSC", wysc_date, tournament_objects
+                        )
+                        wsc_bundle = process_tournament_data(
+                            st.session_state.engine, "WSC", wsc_date, tournament_objects
+                        )
+                        if wysc_bundle:
+                            st.session_state.results["WYSC"] = wysc_bundle
+                        if wsc_bundle:
+                            st.session_state.results["WSC"] = wsc_bundle
+
+                        if wysc_bundle or wsc_bundle:
+                            sync_active_dataset("WSC" if wsc_bundle else "WYSC")
+                            st.session_state.show_dual_run_form = False
+                            st.session_state.dual_run_done_message = (
+                                f"WSC: {'calculated' if wsc_bundle else 'FAILED - check the WSC date'}. "
+                                f"WYSC: {'calculated' if wysc_bundle else 'FAILED - check the WYSC date'}. "
+                                f"View results in the National Leaderboard and Individual Player Audit tabs."
+                            )
+                            st.toast("WAR calculations generated for WSC and WYSC.")
+                            st.rerun()
+                        else:
+                            st.error("Both configurations failed - check the event dates entered.")
+            with cancel_col:
+                if st.button("Cancel", key="dual_run_cancel"):
+                    st.session_state.show_dual_run_form = False
+                    st.rerun()
+
+        if st.session_state.get("dual_run_done_message"):
+            st.success(st.session_state.dual_run_done_message)
+            if st.button("Dismiss", key="dual_run_dismiss"):
+                st.session_state.dual_run_done_message = None
+                st.rerun()
+
+        st.markdown("---")
+        with st.expander("Add Tournament File"):
+            st.caption("Requires the archive password again to confirm, since this writes a "
+                       "new file directly into the archive folder on disk.")
+            add_year = st.text_input(
+                "Year folder (e.g. 2026 - created if it doesn't exist)", key="add_file_year"
+            )
+            add_fname = st.text_input("File name (e.g. MyTournament.txt)", key="add_file_name")
+            add_content = st.text_area("File contents", height=200, key="add_file_content")
+            add_pwd = st.text_input(
+                "Re-enter archive password to confirm", type="password", key="add_file_pwd"
+            )
+            if st.button("Add File", key="add_file_btn"):
+                if add_pwd != ARCHIVE_PASSWORD:
+                    st.error("Incorrect password.")
+                elif not add_year.strip() or not add_fname.strip():
+                    st.error("Enter both a year folder and a file name.")
+                elif not add_fname.strip().lower().endswith(".txt"):
+                    st.error("File name must end in .txt")
+                else:
+                    year_clean = add_year.strip()
+                    fname_clean = add_fname.strip()
+                    target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, year_clean)
+                    target_path = os.path.join(target_dir, fname_clean)
+                    if os.path.exists(target_path):
+                        st.error(f"'{fname_clean}' already exists in '{year_clean}/' - use the "
+                                 f"editor below to modify it instead.")
+                    else:
+                        os.makedirs(target_dir, exist_ok=True)
+                        with open(target_path, "w", encoding="utf-8") as f:
+                            f.write(add_content)
+                        st.success(f"Added '{fname_clean}' to '{year_clean}/'.")
+                        st.rerun()
+        st.markdown("---")
+
         structure = get_archive_structure(st.session_state.engine)
         if not structure:
             st.warning(f"No archive found. Expected year subfolders (e.g. '2024', '2025') under "
@@ -1131,8 +1297,9 @@ with tabs[4]:
                                                     f"detected - looks OK.")
 
                             confirm_key = f"archive_push_confirm_{year}_{fname}"
+                            delete_confirm_key = f"archive_delete_confirm_{year}_{fname}"
 
-                            action_col1, action_col2, action_col3 = st.columns(3)
+                            action_col1, action_col2, action_col3, action_col4 = st.columns(4)
                             with action_col1:
                                 if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
                                     try:
@@ -1154,6 +1321,37 @@ with tabs[4]:
                                     mime='text/plain',
                                     key=f"archive_dl_{year}_{fname}"
                                 )
+                            with action_col4:
+                                if st.button("Delete", key=f"archive_delete_{year}_{fname}"):
+                                    st.session_state[delete_confirm_key] = True
+                                    st.rerun()
+
+                            if st.session_state.get(delete_confirm_key):
+                                st.warning(f"This permanently deletes '{fname}' from the archive on "
+                                           f"this machine (it stays on GitHub until you push the "
+                                           f"deletion separately). Re-enter the archive password to "
+                                           f"confirm.")
+                                del_pwd = st.text_input(
+                                    "Password", type="password", key=f"archive_delete_pwd_{year}_{fname}"
+                                )
+                                del_confirm_col, del_cancel_col = st.columns(2)
+                                with del_confirm_col:
+                                    if st.button("Confirm Delete",
+                                                 key=f"archive_delete_confirm_btn_{year}_{fname}"):
+                                        if del_pwd != ARCHIVE_PASSWORD:
+                                            st.error("Incorrect password.")
+                                        else:
+                                            try:
+                                                os.remove(fpath)
+                                                st.session_state[delete_confirm_key] = False
+                                                st.success(f"Deleted '{fname}'.")
+                                                st.rerun()
+                                            except OSError as e:
+                                                st.error(f"Could not delete {fname}: {e}")
+                                with del_cancel_col:
+                                    if st.button("Cancel", key=f"archive_delete_cancel_{year}_{fname}"):
+                                        st.session_state[delete_confirm_key] = False
+                                        st.rerun()
 
                             if st.session_state.get(confirm_key):
                                 st.warning("This pushes directly to the public GitHub repo (origin/main) "
