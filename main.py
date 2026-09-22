@@ -404,7 +404,7 @@ def find_similar_player_names(names, ratio_threshold=0.85):
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
 DEFAULT_WSC_EVENT_DATE = "01.09.2027"
-DEFAULT_WYSC_EVENT_DATE = "20.08.2027"
+DEFAULT_WYSC_EVENT_DATE = "27.08.2027"
 
 
 def _read_archive_file(fpath):
