@@ -10,6 +10,7 @@ import io
 import base64
 import difflib
 import requests
+import zipfile
 from xml.sax.saxutils import escape as xml_escape
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -402,7 +403,8 @@ def find_similar_player_names(names, ratio_threshold=0.85):
 
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
-DEFAULT_EVENT_DATE = "15.10.2025"
+DEFAULT_WSC_EVENT_DATE = "01.09.2027"
+DEFAULT_WYSC_EVENT_DATE = "20.08.2027"
 
 
 def _read_archive_file(fpath):
@@ -588,6 +590,24 @@ def build_tournament_history(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
 
     rows.sort(key=lambda r: r["Date"], reverse=True)
     return rows
+
+
+def build_archive_zip(base_dir=TOURNAMENT_ARCHIVE_DIR):
+    """Zips every year folder and tournament .txt file under base_dir into a single
+    in-memory archive, preserving the 'year/filename.txt' structure, so the whole
+    tournament archive can be downloaded in one click."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(base_dir):
+            for year in sorted(os.listdir(base_dir)):
+                year_path = os.path.join(base_dir, year)
+                if not os.path.isdir(year_path):
+                    continue
+                for fname in sorted(os.listdir(year_path)):
+                    if fname.lower().endswith(".txt"):
+                        zf.write(os.path.join(year_path, fname), arcname=f"{year}/{fname}")
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def rename_player_across_archive(engine, old_names, new_name, base_dir=TOURNAMENT_ARCHIVE_DIR):
@@ -1495,15 +1515,24 @@ with tabs[3]:
                     st.info(inact['remark'])
 
             # Individual Export
-            indiv_buffer = io.StringIO()
-            indiv_buffer.write(f"Player Name: {player_select}\n\n")
-            p_df.to_csv(indiv_buffer, index=False)
-            st.download_button(
-                label=f"Export {player_select} Results",
-                data=indiv_buffer.getvalue().encode('utf-8'),
-                file_name=f"{player_select.replace(' ', '_')}_WAR.csv",
-                mime='text/csv'
+            all_rows_for_player = build_leaderboard_rows(
+                st.session_state.players_db, st.session_state.full_history_db,
+                st.session_state.inactivity_map, st.session_state.config
             )
+            player_row = next(
+                (r for r in all_rows_for_player if r["Player Name"] == player_select), None
+            )
+            if player_row:
+                indiv_pdf = generate_all_players_audit_pdf(
+                    [player_row], st.session_state.players_db, st.session_state.config,
+                    label=f"{player_select} Individual Audit Report"
+                )
+                st.download_button(
+                    label=f"Export {player_select} Results (PDF)",
+                    data=indiv_pdf,
+                    file_name=f"{player_select.replace(' ', '_')}_WAR.pdf",
+                    mime='application/pdf'
+                )
     else:
         st.info("Awaiting data processing.")
 
@@ -1543,10 +1572,11 @@ with tabs[0]:
     archive_ready = ARCHIVE_PASSWORD and st.session_state.archive_unlocked
 
     if archive_ready:
-        st.header("Tournament File Archive")
-        _archive_btns_spacer, reset_col, refresh_col, lock_col = st.columns(
-            [5, 1, 1, 1], gap="small"
+        header_col, reset_col, refresh_col, lock_col = st.columns(
+            [5, 1, 1, 1], gap="small", vertical_alignment="center"
         )
+        with header_col:
+            st.header("Tournament File Archive")
         with reset_col:
             if st.button("Reset Dataset", help="Clears the currently computed WAR results and "
                                                 "returns the dashboard to its initial state. "
@@ -1593,10 +1623,12 @@ with tabs[0]:
 
         if st.session_state.get("show_dual_run_form"):
             wysc_date = st.text_input(
-                "WYSC International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="dual_run_wysc_date"
+                "WYSC International Event Date (DD.MM.YYYY)", value=DEFAULT_WYSC_EVENT_DATE,
+                key="dual_run_wysc_date"
             )
             wsc_date = st.text_input(
-                "WSC International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="dual_run_wsc_date"
+                "WSC International Event Date (DD.MM.YYYY)", value=DEFAULT_WSC_EVENT_DATE,
+                key="dual_run_wsc_date"
             )
             dual_run_ignore_q5 = st.checkbox(
                 "Ignore Q5 Push (Live View)", value=False, key="dual_run_ignore_q5",
@@ -1901,7 +1933,6 @@ with tabs[0]:
                 with add_col:
                     if st.button("+ Add Tournament File", key="open_add_file_dialog"):
                         add_tournament_file_dialog()
-                st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', across all years.")
                 history_rows = build_tournament_history(st.session_state.engine)
                 if not history_rows:
                     st.warning(f"No tournament files found under '{TOURNAMENT_ARCHIVE_DIR}/'.")
@@ -1909,5 +1940,20 @@ with tabs[0]:
                     hist_df = pd.DataFrame(history_rows)
                     hist_df['Date'] = hist_df['Date'].dt.strftime('%Y-%m-%d')
                     hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
-                    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        hist_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "No.": st.column_config.NumberColumn("No.", width="small"),
+                            "Source File": st.column_config.TextColumn("Source File", width="large"),
+                        },
+                    )
                     st.caption(f"{len(history_rows)} tournaments found across {len(structure)} year folder(s).")
+                    st.download_button(
+                        "Download ZIP of All Tournaments",
+                        data=build_archive_zip(),
+                        file_name="tournament_files_archive.zip",
+                        mime="application/zip",
+                        key="dl_full_archive_zip",
+                    )
