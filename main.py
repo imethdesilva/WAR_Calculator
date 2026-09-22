@@ -204,10 +204,21 @@ class SelectionsEngine:
                     new_rating = int(float(numeric_blocks[-1].replace('(', '').replace(')', '').strip()))
 
                     old_rating = 0
-                    if len(numeric_blocks) >= 5:
-                         try:
-                            old_rating = int(float(numeric_blocks[-3].replace('(', '').replace(')', '').strip()))
-                         except: pass
+                    if len(numeric_blocks) >= 4:
+                        try:
+                            second_last = numeric_blocks[-2]
+                            if '(' in second_last or ')' in second_last:
+                                # The old rating itself was provisional, so this row has no
+                                # separate ratings-change field - "(Old) New" instead of the
+                                # usual "Old Change New" - meaning the old rating is one field
+                                # back from the new rating, not two.
+                                old_rating = int(float(second_last.replace('(', '').replace(')', '').strip()))
+                            elif len(numeric_blocks) >= 5:
+                                old_rating = int(float(
+                                    numeric_blocks[-3].replace('(', '').replace(')', '').strip()
+                                ))
+                        except Exception:
+                            pass
 
                     name_part = re.sub(r'^\s*\d+\s+[\d\-+.]+\s+[\d\-+*&.]+', '', raw_line)
                     name_part = re.sub(r'[\d\-+*&\(\)\s.]+$', '', name_part)
@@ -271,6 +282,13 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
         data = players_db.get(name)
         inact = inactivity_map.get(name, {"override_ineligible": False, "remark": ""})
 
+        # Whether this player's most recent known result (any date, in full_history_db)
+        # was provisional - i.e. their current rating status right now, independent of
+        # whether that result fell inside this mode's WAR window.
+        hist_all = full_history_db.get(name, [])
+        latest_entry = max(hist_all, key=lambda h: h['date']) if hist_all else None
+        is_provisional = bool(latest_entry and latest_entry.get('provisional'))
+
         if data:
             war, war_precise = compute_war(data['history'])
             current_rating = data['current_rating']
@@ -297,6 +315,7 @@ def build_leaderboard_rows(players_db, full_history_db, inactivity_map, conf):
 
         rows.append({
             "Player Name": name,
+            "Provisional": "Prov." if is_provisional else "",
             "WAR": war,
             "Current Rating": current_rating,
             "WAR Precise": round(war_precise, 2),
@@ -1073,7 +1092,8 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf, quad_ranges,
     for idx, row in enumerate(rows_sorted, start=1):
         name = row["Player Name"]
 
-        story.append(Paragraph(f"{idx}. {xml_escape(name)}", styles["PlayerHeading"]))
+        prov_badge = "  [PROVISIONAL]" if row.get("Provisional") else ""
+        story.append(Paragraph(f"{idx}. {xml_escape(name)}{prov_badge}", styles["PlayerHeading"]))
         story.append(Paragraph(f"WAR: {row['WAR']}  |  Status: {row['Status']}", status_style))
 
         summary_data = [
@@ -1537,7 +1557,11 @@ with tabs[3]:
         player_select = st.selectbox("Search Player for Audit", sorted(st.session_state.players_db.keys()))
         if player_select:
             p_data = st.session_state.players_db[player_select]
-            st.subheader(f"Participation History: {player_select}")
+            hist_all = st.session_state.full_history_db.get(player_select, [])
+            latest_entry = max(hist_all, key=lambda h: h['date']) if hist_all else None
+            is_provisional = bool(latest_entry and latest_entry.get('provisional'))
+            prov_suffix = "  **[PROVISIONAL]**" if is_provisional else ""
+            st.subheader(f"Participation History: {player_select}{prov_suffix}")
 
             p_df = pd.DataFrame(p_data["history"])
             p_df['Date_dt'] = pd.to_datetime(p_df['Date'])
@@ -1744,6 +1768,25 @@ with tabs[0]:
             st.warning(f"No archive found. Expected year subfolders (e.g. '2024', '2025') under "
                        f"'{TOURNAMENT_ARCHIVE_DIR}/' next to main.py.")
         else:
+            quality_objects = load_all_archive_tournament_objects(st.session_state.engine)
+            quality_warnings = {
+                obj['source_filename']: obj['warnings']
+                for obj in quality_objects if obj.get('warnings')
+            }
+            total_quality_warnings = sum(len(w) for w in quality_warnings.values())
+            if total_quality_warnings:
+                with st.expander(
+                    f"⚠ Data Quality: {total_quality_warnings} parse warning(s) across "
+                    f"{len(quality_warnings)} file(s)", expanded=False
+                ):
+                    for fname, warns in quality_warnings.items():
+                        st.markdown(f"**{fname}**")
+                        for w in warns:
+                            st.caption(f"- {w}")
+            else:
+                st.caption(f"✓ Data Quality: no parse warnings across "
+                           f"{len(quality_objects)} tournament file(s).")
+
             year_tabs = st.tabs([year for year, _ in structure] + ["All Tournaments"])
             for year_tab, (year, files) in zip(year_tabs[:-1], structure):
                 with year_tab:
