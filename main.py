@@ -18,7 +18,7 @@ from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, KeepTogether
 )
 
 class SelectionsEngine:
@@ -1099,15 +1099,44 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf, quad_ranges,
         data = players_db.get(name)
         if data and data["history"]:
             history_sorted = sorted(data["history"], key=lambda h: h["Date"], reverse=True)
-            hist_data = [["Date", "Tournament", "Quad", "Weight", "Old", "New", "Games"]]
+            hist_data = [["Date", "Tournament", "Quad", "Weight", "Old", "New", "Games", "Wtd. Value"]]
             for h in history_sorted:
                 hist_data.append([
                     h["Date"], _pdf_cell(h["Tournament"]), f"Q{h['Quad']}", f"{h['Weight']:.2f}",
-                    str(h["Old Rating"]), str(h["New Rating"]), str(h["Games"])
+                    str(h["Old Rating"]), str(h["New Rating"]), str(h["Games"]),
+                    f"{h['WeightedVal']:.2f}"
                 ])
             story.append(_pdf_table(
-                hist_data, col_widths=[1.9*cm, 6.5*cm, 1.1*cm, 1.4*cm, 1.4*cm, 1.4*cm, 1.3*cm]
+                hist_data,
+                col_widths=[1.7*cm, 5.4*cm, 1.0*cm, 1.3*cm, 1.2*cm, 1.2*cm, 1.1*cm, 1.9*cm]
             ))
+            story.append(Paragraph(
+                "Weighted Value = Weight &#215; New Rating (rating after that tournament).",
+                styles["BodySmall"]
+            ))
+            story.append(Spacer(1, 4))
+
+            total_weight = sum(h["Weight"] for h in history_sorted)
+            total_weighted_val = sum(h["WeightedVal"] for h in history_sorted)
+            calc_war, calc_war_precise = compute_war(history_sorted)
+            breakdown_data = [
+                ["Total Weight (Sum of Weight column)", f"{total_weight:.2f}"],
+                ["Total Weighted Value (Sum of Wtd. Value column)", f"{total_weighted_val:.2f}"],
+                ["Final WAR = Total Weighted Value / Total Weight",
+                 f"{total_weighted_val:.2f} / {total_weight:.2f} = {calc_war_precise:.2f} -> {calc_war}"],
+            ]
+            breakdown_table = Table(breakdown_data, colWidths=[7.5*cm, 8.5*cm])
+            breakdown_table.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica-Bold'),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.3, PDF_BORDER),
+                ('BACKGROUND', (0, -1), (-1, -1), PDF_LIGHT_ROW),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            story.append(KeepTogether([breakdown_table]))
         else:
             story.append(Paragraph(
                 "No qualifying (non-provisional, in-window) tournament history found.", styles["BodySmall"]
