@@ -14,6 +14,15 @@ The Weighted Average Rating (WAR) system rewards consistency and recent form. It
 
 ---
 
+## 🚀 Use the App
+No installation needed - the app is already live:
+
+**[https://selections-war-calculations.streamlit.app/](https://selections-war-calculations.streamlit.app/)**
+
+Just open the link. The "Running Your Own Instance / Local Development" section below is only for self-hosting or contributing to the code.
+
+---
+
 ## Key Features
 
 *   **GitHub-Backed Tournament Archive:** Tournament files live under `tournament files/<year>/*.txt` and are pushed to/deleted from this repo directly from the app via the GitHub Contents API - browse, edit, rename, delete, or add a new file (with a review step before anything is pushed) without touching git yourself.
@@ -29,7 +38,8 @@ The Weighted Average Rating (WAR) system rewards consistency and recent form. It
 
 ---
 
-## 🛠️ Installation & Setup
+## 🛠️ Running Your Own Instance / Local Development
+Only needed if you want to self-host the app or work on the code - not required to just use it.
 
 ### Prerequisites
 *   **Python 3.12** is recommended.
@@ -67,7 +77,7 @@ The Weighted Average Rating (WAR) system rewards consistency and recent form. It
 
 ## Usage Instructions
 
-1. **Launch the app:** `streamlit run main.py`
+1. **Open the app:** use the [live link](https://selections-war-calculations.streamlit.app/), or run `streamlit run main.py` for a local instance.
 2. **Unlock the Tournament Archive:** enter the shared `ARCHIVE_PASSWORD` plus your name/initials (recorded on every change you make from then on).
 3. **Build the archive:** files already in `tournament files/<year>/` show up automatically. Add more via the **+ Add Tournament File** button on the "All Tournaments" sub-tab - the year folder is detected from the date in the file, and nothing is pushed to GitHub until you review the parsed summary and confirm.
 4. **Run WAR for WYSC and WSC:** enter each classification's international event date and confirm - both get calculated and cached together.
