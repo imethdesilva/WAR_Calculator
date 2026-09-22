@@ -945,6 +945,49 @@ def _pdf_header(story, styles, title, subtitle):
     story.append(HRFlowable(width="100%", color=colors.black, thickness=1.2, spaceAfter=12))
 
 
+def _pdf_calculation_details_table(conf, players_assessed, players_qualified):
+    """The 'how this window was derived' table - international event date, cut-off
+    date and the eligibility thresholds - shared by the calculation report and the
+    player audit report(s) so every PDF that shows player results also explains
+    where those results came from."""
+    details_data = [
+        ["Tournament Classification", conf['mode']],
+        ["International Event Date", conf['intl_date'].strftime('%d %b %Y')],
+        ["Cut-off Date", conf['cutoff_date'].strftime('%d %b %Y')],
+        ["Minimum WAR Required", str(conf['min_war'])],
+        ["Minimum Games Required", str(conf['req_games'])],
+        ["Minimum Tournaments Required", str(conf['req_tours'])],
+        ["Minimum Quadrimesters Required", str(conf['min_quads'])],
+        ["Recent Activity Requirement", f"{conf['req_recent']} tournament(s) in Q4/Q5"],
+        ["Players Assessed", str(players_assessed)],
+        ["Players Qualified", str(players_qualified)],
+    ]
+    detail_table = Table(details_data, colWidths=[7*cm, 8.2*cm])
+    detail_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 0.4, PDF_BORDER),
+        ('BACKGROUND', (0, 0), (0, -1), PDF_LIGHT_ROW),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    return detail_table
+
+
+def _pdf_quad_schedule_table(quad_ranges):
+    """The fixed quadrimester date ranges and weights actually used for this
+    calculation - shared by the calculation report and the player audit report(s)."""
+    quad_data = [["Period", "Weight Factor", "Start", "End"]]
+    for q in quad_ranges:
+        quad_data.append([
+            f"Q{q['quad']}", f"{q['weight']:.2f}",
+            q['start'].strftime('%Y-%m-%d'), q['end'].strftime('%Y-%m-%d')
+        ])
+    return _pdf_table(quad_data, col_widths=[3*cm, 3.5*cm, 4.4*cm, 4.4*cm])
+
+
 def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tournaments):
     """Builds the 'Generate Report' PDF: calculation specifics (cutoff date, event
     date, thresholds), the quadrimester weighting schedule, a qualification summary,
@@ -967,39 +1010,10 @@ def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tourname
 
     story.append(Paragraph("Calculation Details", styles["SectionHeading"]))
     qualified_count = sum(1 for r in rows if r["Status"] == "QUALIFIED")
-    details_data = [
-        ["Tournament Classification", conf['mode']],
-        ["International Event Date", conf['intl_date'].strftime('%d %b %Y')],
-        ["Cut-off Date", conf['cutoff_date'].strftime('%d %b %Y')],
-        ["Minimum WAR Required", str(conf['min_war'])],
-        ["Minimum Games Required", str(conf['req_games'])],
-        ["Minimum Tournaments Required", str(conf['req_tours'])],
-        ["Minimum Quadrimesters Required", str(conf['min_quads'])],
-        ["Recent Activity Requirement", f"{conf['req_recent']} tournament(s) in Q4/Q5"],
-        ["Players Assessed", str(len(rows))],
-        ["Players Qualified", str(qualified_count)],
-    ]
-    detail_table = Table(details_data, colWidths=[7*cm, 8.2*cm])
-    detail_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('GRID', (0, 0), (-1, -1), 0.4, PDF_BORDER),
-        ('BACKGROUND', (0, 0), (0, -1), PDF_LIGHT_ROW),
-        ('TOPPADDING', (0, 0), (-1, -1), 5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 8),
-    ]))
-    story.append(detail_table)
+    story.append(_pdf_calculation_details_table(conf, len(rows), qualified_count))
 
     story.append(Paragraph("Quadrimester Weighting Schedule", styles["SectionHeading"]))
-    quad_data = [["Period", "Weight Factor", "Start", "End"]]
-    for q in quad_ranges:
-        quad_data.append([
-            f"Q{q['quad']}", f"{q['weight']:.2f}",
-            q['start'].strftime('%Y-%m-%d'), q['end'].strftime('%Y-%m-%d')
-        ])
-    story.append(_pdf_table(quad_data, col_widths=[3*cm, 3.5*cm, 4.4*cm, 4.4*cm]))
+    story.append(_pdf_quad_schedule_table(quad_ranges))
 
     story.append(Paragraph("Tournaments Considered for WAR (Latest First)", styles["SectionHeading"]))
     if not considered_tournaments:
@@ -1017,12 +1031,16 @@ def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tourname
     return buf.getvalue()
 
 
-def generate_all_players_audit_pdf(rows_sorted, players_db, conf, label="Individual Player Audit Report"):
+def generate_all_players_audit_pdf(rows_sorted, players_db, conf, quad_ranges,
+                                    label="Individual Player Audit Report"):
     """Builds a per-player audit PDF - one section per player, in the same
     highest-WAR-first order as the leaderboard, each with a summary table and
-    their full tournament history (latest first). Used for both the all-players
-    and qualified-players-only reports; `label` distinguishes the two in the
-    PDF's own title so it's self-describing once downloaded."""
+    their full tournament history (latest first). Used for the all-players,
+    qualified-players-only, and single-player reports; `label` distinguishes them
+    in the PDF's own title so it's self-describing once downloaded. Opens with the
+    same Calculation Details / Quadrimester Weighting Schedule sections as the
+    calculation report, so a player audit is self-contained proof of how the
+    international event date and cut-off date drove every result inside it."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.6*cm, bottomMargin=1.6*cm,
@@ -1042,6 +1060,15 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf, label="Individ
         f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')} - {len(rows_sorted)} player(s), "
         f"ranked by highest WAR first - Scrabble Federation of Sri Lanka - WAR Calculator"
     )
+
+    story.append(Paragraph("Calculation Details", styles["SectionHeading"]))
+    qualified_count = sum(1 for r in rows_sorted if r["Status"] == "QUALIFIED")
+    story.append(_pdf_calculation_details_table(conf, len(rows_sorted), qualified_count))
+
+    story.append(Paragraph("Quadrimester Weighting Schedule", styles["SectionHeading"]))
+    story.append(_pdf_quad_schedule_table(quad_ranges))
+    story.append(Spacer(1, 6))
+    story.append(HRFlowable(width="100%", color=colors.black, thickness=1, spaceAfter=10))
 
     for idx, row in enumerate(rows_sorted, start=1):
         name = row["Player Name"]
@@ -1446,11 +1473,12 @@ with tabs[2]:
                             st.error(f"Upload failed: {e}")
 
                 all_players_pdf = generate_all_players_audit_pdf(
-                    rows, st.session_state.players_db, conf, label="All Players Audit Report"
+                    rows, st.session_state.players_db, conf, st.session_state.quad_ranges,
+                    label="All Players Audit Report"
                 )
                 qualified_rows = [r for r in rows if r["Status"] == "QUALIFIED"]
                 qualified_pdf = generate_all_players_audit_pdf(
-                    qualified_rows, st.session_state.players_db, conf,
+                    qualified_rows, st.session_state.players_db, conf, st.session_state.quad_ranges,
                     label="Qualified Players Audit Report"
                 )
 
@@ -1525,6 +1553,7 @@ with tabs[3]:
             if player_row:
                 indiv_pdf = generate_all_players_audit_pdf(
                     [player_row], st.session_state.players_db, st.session_state.config,
+                    st.session_state.quad_ranges,
                     label=f"{player_select} Individual Audit Report"
                 )
                 st.download_button(
