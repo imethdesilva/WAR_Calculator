@@ -17,7 +17,7 @@ from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable, Image
+    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
 )
 
 class SelectionsEngine:
@@ -400,7 +400,6 @@ def find_similar_player_names(names, ratio_threshold=0.85):
     return pairs
 
 
-LOGO_PATH = "assets/fed_logo.png"
 TOURNAMENT_ARCHIVE_DIR = "tournament files"
 ARCHIVE_PASSWORD = st.secrets.get("ARCHIVE_PASSWORD")
 DEFAULT_EVENT_DATE = "15.10.2025"
@@ -484,6 +483,54 @@ def delete_archive_file_from_github(repo_path, commit_message):
     del_resp = requests.delete(api_url, headers=headers, json=payload, timeout=30)
     del_resp.raise_for_status()
     return True
+
+
+@st.dialog("Add Tournament File")
+def add_tournament_file_dialog():
+    """Modal opened from the 'All Tournaments' tab's '+' button: upload a .txt file,
+    the year folder is auto-detected from the date parsed out of it, and it's saved
+    locally and pushed to GitHub immediately - unlike editing an existing file, a
+    brand-new file carries no risk of overwriting something, so there's no separate
+    review-then-confirm step here."""
+    st.caption("Upload a .txt file - the year folder is detected automatically from the date "
+               "in the file, and it's saved locally and pushed straight to GitHub.")
+    uploaded_new_file = st.file_uploader(
+        "Upload a tournament .txt file", type=["txt"], key="add_file_uploader_dialog"
+    )
+    if uploaded_new_file is None:
+        return
+
+    uploaded_content = uploaded_new_file.read().decode('utf-8', errors='ignore')
+    uploaded_data = st.session_state.engine.parse_tournament_file(uploaded_content)
+    if not uploaded_data:
+        st.error("Could not detect a tournament date in the first 5 lines of this file - it "
+                 "doesn't look like a valid results file.")
+        return
+
+    detected_year = str(uploaded_data['date'].year)
+    st.success(f"Detected: **{uploaded_data['name'] or 'Unknown tournament'}** on "
+               f"{uploaded_data['date']:%Y-%m-%d} - will be added to '{detected_year}/'.")
+
+    target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, detected_year)
+    target_path = os.path.join(target_dir, uploaded_new_file.name)
+    if os.path.exists(target_path):
+        st.error(f"'{uploaded_new_file.name}' already exists in '{detected_year}/' - open it "
+                 f"from the archive list to edit it instead.")
+        return
+
+    if st.button("Add & Push to GitHub", key="add_file_upload_btn_dialog"):
+        os.makedirs(target_dir, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(uploaded_content)
+        try:
+            push_archive_file_to_github(
+                target_path,
+                f"Add {uploaded_new_file.name} ({detected_year}) via WAR Calculator dashboard"
+            )
+            st.success(f"Added '{uploaded_new_file.name}' to '{detected_year}/' and pushed to GitHub.")
+        except (KeyError, requests.exceptions.RequestException) as e:
+            st.warning(f"Saved locally, but the GitHub push failed: {e}")
+        st.rerun()
 
 
 def get_archive_structure(engine, base_dir=TOURNAMENT_ARCHIVE_DIR):
@@ -873,13 +920,6 @@ def _pdf_table(data, col_widths=None):
 
 
 def _pdf_header(story, styles, title, subtitle):
-    if os.path.exists(LOGO_PATH):
-        # Source logo is a wide mark (lion + tile beside the wordmark), 783x319px.
-        logo_height = 1.5 * cm
-        logo = Image(LOGO_PATH, width=logo_height * (783 / 319), height=logo_height)
-        logo.hAlign = 'CENTER'
-        story.append(logo)
-        story.append(Spacer(1, 6))
     story.append(Paragraph(xml_escape(title), styles["ReportTitle"]))
     story.append(Paragraph(xml_escape(subtitle), styles["ReportSubtitle"]))
     story.append(HRFlowable(width="100%", color=colors.black, thickness=1.2, spaceAfter=12))
@@ -957,15 +997,16 @@ def generate_calculation_report_pdf(conf, quad_ranges, rows, considered_tourname
     return buf.getvalue()
 
 
-def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
-    """Builds the 'Generate Report for All Players' PDF: one audit section per
-    player, in the same highest-WAR-first order as the leaderboard, each with a
-    summary table and their full tournament history (latest first) - the PDF
-    equivalent of the Individual Player Audit tab, covering every player at once."""
+def generate_all_players_audit_pdf(rows_sorted, players_db, conf, label="Individual Player Audit Report"):
+    """Builds a per-player audit PDF - one section per player, in the same
+    highest-WAR-first order as the leaderboard, each with a summary table and
+    their full tournament history (latest first). Used for both the all-players
+    and qualified-players-only reports; `label` distinguishes the two in the
+    PDF's own title so it's self-describing once downloaded."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.6*cm, bottomMargin=1.6*cm,
-        title=f"{conf['mode']} Individual Player Audits"
+        title=f"{conf['mode']} {label}"
     )
     styles = _pdf_styles()
     status_style = ParagraphStyle(
@@ -977,7 +1018,7 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
     story = []
 
     _pdf_header(
-        story, styles, f"Individual Player Audit Report - {conf['mode']}",
+        story, styles, f"{label} - {conf['mode']}",
         f"Generated {datetime.now().strftime('%d %B %Y, %H:%M')} - {len(rows_sorted)} player(s), "
         f"ranked by highest WAR first - Scrabble Federation of Sri Lanka - WAR Calculator"
     )
@@ -1038,10 +1079,7 @@ def generate_all_players_audit_pdf(rows_sorted, players_db, conf):
 
 
 # UI
-st.set_page_config(
-    page_title="National Selections Dashboard", layout="wide",
-    page_icon=LOGO_PATH if os.path.exists(LOGO_PATH) else None
-)
+st.set_page_config(page_title="National Selections Dashboard", layout="wide")
 
 st.markdown("""
     <style>
@@ -1062,16 +1100,23 @@ st.markdown("""
     div[data-testid="stMetricLabel"] > div { color: var(--text-color); opacity: 0.8; font-weight: 600; }
 
     /* 2. Professional Buttons and Tabs */
-    div.stButton > button:first-child { 
-        background-color: #004a99; 
-        color: white; 
-        border-radius: 5px; 
-        width: 100%; 
-        font-weight: bold; 
-        border: none; 
+    div.stButton > button:first-child {
+        background-color: #004a99;
+        color: white;
+        border-radius: 5px;
+        width: 100%;
+        font-weight: bold;
+        border: none;
     }
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { font-weight: 600; }
+
+    /* 2b. Tighten the gap between columns so button rows sit close together
+       instead of spreading edge-to-edge - paired with narrow column ratios
+       (plus a spacer column) wherever multiple buttons sit in one row. */
+    div[data-testid="stHorizontalBlock"] {
+        gap: 0.5rem;
+    }
 
     /* 3. Global Centering: Applied to standard Tables and modern DataFrames */
     [data-testid="stTable"] th, 
@@ -1103,17 +1148,13 @@ if 'engine' not in st.session_state:
     st.session_state.uploaded_tournament_dates = []
     st.session_state.upload_warnings = {}
     st.session_state.archive_unlocked = False
+    st.session_state.archive_renames = {}
     st.session_state.results = {}
     st.session_state.active_mode = None
 
 # Main
-header_logo_col, header_title_col = st.columns([2, 5], vertical_alignment="center")
-with header_logo_col:
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=220)
-with header_title_col:
-    st.title("National Scrabble Selections - WAR Calculator")
-    st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
+st.title("National Scrabble Selections - WAR Calculator")
+st.caption("Official Administrative System for Weighted Average Rating (WAR) Calculation")
 
 if st.session_state.active_mode and len(st.session_state.results) > 1:
     cached_modes = list(st.session_state.results.keys())
@@ -1260,7 +1301,7 @@ with tabs[2]:
                             st.caption("Optional: push these files straight to GitHub (origin/main) now, "
                                        "instead of reviewing/pushing each one individually from the "
                                        "Tournament Archive tab.")
-                            push_col, dismiss_col = st.columns(2)
+                            push_col, dismiss_col, _spacer = st.columns([3, 1, 5])
                             with push_col:
                                 if st.button("Push These Changes to GitHub Now",
                                              key=f"merge_push_{name_a}_{name_b}"):
@@ -1343,7 +1384,7 @@ with tabs[2]:
 
                 report_csv = generate_full_report_csv(filtered_rows, st.session_state.players_db, conf, conf['mode'])
 
-                export_col, push_col, pdf_col = st.columns(3)
+                export_col, push_col, _spacer1 = st.columns([2, 2, 4])
                 with export_col:
                     st.download_button(
                         "Export Full Selection Report (CSV)",
@@ -1363,23 +1404,32 @@ with tabs[2]:
                                       "PythonAnywhere) and restart the app.")
                         except requests.exceptions.RequestException as e:
                             st.error(f"Upload failed: {e}")
-                with pdf_col:
-                    if st.button("Generate Report for All Players (PDF)"):
-                        with st.spinner("Building the PDF audit report for all players..."):
-                            st.session_state.all_players_pdf = generate_all_players_audit_pdf(
-                                rows, st.session_state.players_db, conf
-                            )
-                            st.session_state.all_players_pdf_mode = conf['mode']
-                        st.rerun()
 
-                if (st.session_state.get("all_players_pdf") is not None
-                        and st.session_state.get("all_players_pdf_mode") == conf['mode']):
+                all_players_pdf = generate_all_players_audit_pdf(
+                    rows, st.session_state.players_db, conf, label="All Players Audit Report"
+                )
+                qualified_rows = [r for r in rows if r["Status"] == "QUALIFIED"]
+                qualified_pdf = generate_all_players_audit_pdf(
+                    qualified_rows, st.session_state.players_db, conf,
+                    label="Qualified Players Audit Report"
+                )
+
+                all_pdf_col, qualified_pdf_col, _spacer2 = st.columns([2, 2, 4])
+                with all_pdf_col:
                     st.download_button(
                         "Download All Players Audit Report (PDF)",
-                        data=st.session_state.all_players_pdf,
+                        data=all_players_pdf,
                         file_name=f"{conf['mode']}_all_players_audit_report.pdf",
                         mime="application/pdf",
                         key="dl_all_players_pdf"
+                    )
+                with qualified_pdf_col:
+                    st.download_button(
+                        "Download Qualified Players Audit Report (PDF)",
+                        data=qualified_pdf,
+                        file_name=f"{conf['mode']}_qualified_players_audit_report.pdf",
+                        mime="application/pdf",
+                        key="dl_qualified_players_pdf"
                     )
     else:
         st.warning("Run WAR from the Tournament Archive tab to generate rankings.")
@@ -1535,7 +1585,7 @@ with tabs[0]:
                      "rules and anchors Q5 to each cutoff date's natural quadrimester. Leave off "
                      "for the official selection calculation."
             )
-            run_col, cancel_col = st.columns(2)
+            run_col, cancel_col, _spacer = st.columns([2, 1, 6])
             with run_col:
                 if st.button("Confirm & Run", key="dual_run_confirm"):
                     tournament_objects = load_all_archive_tournament_objects(st.session_state.engine)
@@ -1645,9 +1695,13 @@ with tabs[0]:
                             confirm_key = f"archive_push_confirm_{year}_{fname}"
                             delete_confirm_key = f"archive_delete_confirm_{year}_{fname}"
                             new_fname = st.session_state[fname_key].strip()
+                            # The name GitHub still has this file under, if a rename hasn't been
+                            # pushed yet - tracked across saves so a rename never gets "lost" and
+                            # leaves the old filename duplicated on GitHub after a later push.
+                            original_github_name = st.session_state.archive_renames.get((year, fname), fname)
 
                             action_col1, action_col2, action_col3, action_col4, _spacer = st.columns(
-                                [1, 1, 1, 1, 3], gap="small"
+                                [1.3, 2, 1, 1, 3], gap="small"
                             )
                             with action_col1:
                                 if st.button("Save Changes", key=f"archive_save_{year}_{fname}"):
@@ -1665,8 +1719,18 @@ with tabs[0]:
                                                     f.write(edited_text)
                                                 if new_fname != fname:
                                                     os.remove(fpath)
+                                                    # Carry forward the true original name (not just
+                                                    # the immediately-previous one) so a chain of local
+                                                    # renames still resolves to a single GitHub delete
+                                                    # once pushed.
+                                                    st.session_state.archive_renames.pop((year, fname), None)
+                                                    if new_fname != original_github_name:
+                                                        st.session_state.archive_renames[(year, new_fname)] = (
+                                                            original_github_name
+                                                        )
                                                     st.success(f"Saved as '{new_fname}' (renamed from "
-                                                               f"'{fname}') on this machine.")
+                                                               f"'{fname}') on this machine. Push to "
+                                                               f"GitHub to rename it there too.")
                                                 else:
                                                     st.success(f"Saved changes to {fname} on this machine.")
                                                 st.rerun()
@@ -1697,7 +1761,7 @@ with tabs[0]:
                                 del_pwd = st.text_input(
                                     "Password", type="password", key=f"archive_delete_pwd_{year}_{fname}"
                                 )
-                                del_confirm_col, del_cancel_col = st.columns(2)
+                                del_confirm_col, del_cancel_col, _spacer = st.columns([2, 1, 6])
                                 with del_confirm_col:
                                     if st.button("Confirm Delete",
                                                  key=f"archive_delete_confirm_btn_{year}_{fname}"):
@@ -1717,12 +1781,12 @@ with tabs[0]:
                                         st.rerun()
 
                             if st.session_state.get(confirm_key):
-                                is_rename = new_fname and new_fname != fname
+                                is_rename = bool(new_fname) and new_fname != original_github_name
                                 if is_rename:
-                                    st.warning(f"This renames '{fname}' to '{new_fname}' and pushes the "
-                                               f"content directly to the public GitHub repo (origin/main) "
-                                               f"- both the new file and removal of the old one - with no "
-                                               f"review step. Confirm you want to publish this.")
+                                    st.warning(f"This renames '{original_github_name}' to '{new_fname}' on "
+                                               f"GitHub (origin/main) - pushes the new file and removes the "
+                                               f"old one, in two commits, with no review step. Confirm you "
+                                               f"want to publish this.")
                                 else:
                                     st.warning("This pushes directly to the public GitHub repo (origin/main) "
                                                "with no review step. Confirm you want to publish this edit.")
@@ -1735,7 +1799,7 @@ with tabs[0]:
                                 elif not is_rename:
                                     st.caption("No textual changes detected - this will push the file as-is.")
 
-                                confirm_col, cancel_col = st.columns(2)
+                                confirm_col, cancel_col, _spacer = st.columns([2, 1, 6])
                                 with confirm_col:
                                     if st.button("Confirm & Push", key=f"archive_push_confirm_btn_{year}_{fname}"):
                                         if not new_fname:
@@ -1747,12 +1811,12 @@ with tabs[0]:
                                             try:
                                                 with open(new_fpath, "w", encoding="utf-8") as f:
                                                     f.write(edited_text)
-                                                if is_rename and os.path.exists(fpath):
+                                                if new_fname != fname and os.path.exists(fpath):
                                                     os.remove(fpath)
 
                                                 commit_msg = (
-                                                    f"Rename {fname} to {new_fname} ({year}) via WAR "
-                                                    f"Calculator dashboard" if is_rename else
+                                                    f"Rename {original_github_name} to {new_fname} "
+                                                    f"({year}) via WAR Calculator dashboard" if is_rename else
                                                     f"Edit {fname} ({year}) via WAR Calculator dashboard"
                                                 )
                                                 pushed = push_archive_file_to_github(new_fpath, commit_msg)
@@ -1760,27 +1824,33 @@ with tabs[0]:
                                                 removed_old = False
                                                 if is_rename:
                                                     old_repo_path = os.path.join(
-                                                        TOURNAMENT_ARCHIVE_DIR, year, fname
+                                                        TOURNAMENT_ARCHIVE_DIR, year, original_github_name
                                                     )
                                                     removed_old = delete_archive_file_from_github(
                                                         old_repo_path,
-                                                        f"Remove {fname} ({year}) - renamed to "
-                                                        f"{new_fname} via WAR Calculator dashboard"
+                                                        f"Remove {original_github_name} ({year}) - renamed "
+                                                        f"to {new_fname} via WAR Calculator dashboard"
                                                     )
+
+                                                # GitHub and local now agree under new_fname - drop any
+                                                # rename tracking for both the old and new names.
+                                                st.session_state.archive_renames.pop((year, fname), None)
+                                                st.session_state.archive_renames.pop((year, new_fname), None)
 
                                                 st.session_state[confirm_key] = False
                                                 if is_rename:
                                                     st.success(
-                                                        f"Renamed '{fname}' to '{new_fname}' on GitHub"
+                                                        f"Renamed '{original_github_name}' to '{new_fname}' "
+                                                        f"on GitHub"
                                                         + (" and removed the old file there."
                                                            if removed_old else
                                                            " (old file wasn't on GitHub, nothing to "
                                                            "remove there).")
                                                     )
                                                 elif pushed:
-                                                    st.success(f"Pushed {fname} to the GitHub repo (origin/main).")
+                                                    st.success(f"Pushed {new_fname} to the GitHub repo (origin/main).")
                                                 else:
-                                                    st.info(f"{fname} already matches what's on GitHub - "
+                                                    st.info(f"{new_fname} already matches what's on GitHub - "
                                                             f"nothing to push.")
                                                 st.rerun()
                                             except (OSError, KeyError, requests.exceptions.RequestException) as e:
@@ -1791,7 +1861,12 @@ with tabs[0]:
                                         st.rerun()
 
             with year_tabs[-1]:
-                st.subheader("All Tournaments (Latest First)")
+                title_col, add_col, _spacer = st.columns([5, 1, 2])
+                with title_col:
+                    st.subheader("All Tournaments (Latest First)")
+                with add_col:
+                    if st.button("+ Add Tournament File", key="open_add_file_dialog"):
+                        add_tournament_file_dialog()
                 st.caption(f"Every tournament found under '{TOURNAMENT_ARCHIVE_DIR}/', across all years.")
                 history_rows = build_tournament_history(st.session_state.engine)
                 if not history_rows:
@@ -1802,117 +1877,3 @@ with tabs[0]:
                     hist_df.insert(0, "No.", range(1, len(hist_df) + 1))
                     st.dataframe(hist_df, use_container_width=True, hide_index=True)
                     st.caption(f"{len(history_rows)} tournaments found across {len(structure)} year folder(s).")
-        st.markdown("---")
-        with st.expander("Advanced: Manual / One-off Upload"):
-            st.caption("For testing a single mode against a handful of files outside the archive, "
-                       "instead of the full archive-wide run above.")
-            manual_mode = st.selectbox("Tournament Classification", ["WSC", "WYSC"], key="manual_mode")
-            manual_event_date = st.text_input(
-                "International Event Date (DD.MM.YYYY)", value=DEFAULT_EVENT_DATE, key="manual_event_date"
-            )
-            manual_ignore_q5 = st.toggle(
-                "Ignore Q5 Push (Live View)", value=False, key="manual_ignore_q5",
-                help="Official selection rules push Q5 back a full quadrimester when it's still empty "
-                     "(PDF p.3). Turn this on to instead always anchor Q5 to the cutoff date's natural "
-                     "quadrimester, so you can watch live WAR update as new results come in, ahead of "
-                     "the official cutoff determination."
-            )
-
-            if st.button("Initialize Selection Window (Preview)", key="manual_init_window"):
-                config, quads = st.session_state.engine.calculate_configuration(
-                    manual_mode, manual_event_date,
-                    tournament_dates=st.session_state.uploaded_tournament_dates,
-                    ignore_q5_push=manual_ignore_q5
-                )
-                if config:
-                    st.session_state.config = config
-                    st.session_state.quad_ranges = quads
-                    if manual_ignore_q5:
-                        st.warning("Live View active: Q5 push-back rule is disabled. This is for "
-                                   "monitoring current-form WAR only, not official selection.")
-                    elif not st.session_state.uploaded_tournament_dates:
-                        st.info("Preview only (no tournament files uploaded yet) - Q5 is assumed "
-                                "empty per the PDF's 'no tournament held' rule until real results "
-                                "are processed.")
-                    st.success("Configuration Validated")
-
-            manual_uploaded_files = st.file_uploader(
-                "Upload Tournament Files (.txt)", accept_multiple_files=True, key="manual_uploader"
-            )
-            if manual_uploaded_files and st.button("Process Tournament Results", key="manual_process"):
-                parsed_tournament_objects = []
-                for f in manual_uploaded_files:
-                    content = f.read().decode('utf-8', errors='ignore')
-                    data = st.session_state.engine.parse_tournament_file(content)
-                    if data:
-                        data['source_filename'] = f.name
-                        parsed_tournament_objects.append(data)
-
-                if not parsed_tournament_objects:
-                    st.error("No valid tournament data found in uploaded files.")
-                else:
-                    bundle = process_tournament_data(
-                        st.session_state.engine, manual_mode, manual_event_date,
-                        parsed_tournament_objects, ignore_q5_push=manual_ignore_q5
-                    )
-                    if bundle:
-                        st.session_state.results[manual_mode] = bundle
-                        sync_active_dataset(manual_mode)
-                        st.success("Calculated WAR using Seasonal Calendar Weights")
-                        st.rerun()
-
-        with st.expander("Add Tournament File"):
-            st.caption("Upload a .txt file directly - the year folder is detected automatically "
-                       "from the date in the file.")
-            uploaded_new_file = st.file_uploader(
-                "Upload a tournament .txt file", type=["txt"], key="add_file_uploader"
-            )
-            if uploaded_new_file is not None:
-                uploaded_content = uploaded_new_file.read().decode('utf-8', errors='ignore')
-                uploaded_data = st.session_state.engine.parse_tournament_file(uploaded_content)
-                if not uploaded_data:
-                    st.error("Could not detect a tournament date in the first 5 lines of this "
-                             "file - it doesn't look like a valid results file.")
-                else:
-                    detected_year = str(uploaded_data['date'].year)
-                    st.success(f"Detected: **{uploaded_data['name'] or 'Unknown tournament'}** on "
-                               f"{uploaded_data['date']:%Y-%m-%d} - will be added to "
-                               f"'{detected_year}/'.")
-                    upload_target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, detected_year)
-                    upload_target_path = os.path.join(upload_target_dir, uploaded_new_file.name)
-                    if os.path.exists(upload_target_path):
-                        st.error(f"'{uploaded_new_file.name}' already exists in '{detected_year}/' "
-                                 f"- use the editor in the archive list below to modify it instead.")
-                    elif st.button("Add Uploaded File to Archive", key="add_file_upload_btn"):
-                        os.makedirs(upload_target_dir, exist_ok=True)
-                        with open(upload_target_path, "w", encoding="utf-8") as f:
-                            f.write(uploaded_content)
-                        st.success(f"Added '{uploaded_new_file.name}' to '{detected_year}/'.")
-                        st.rerun()
-
-            st.markdown("---")
-            st.caption("Or paste file contents in manually, and pick the year folder yourself:")
-            add_year = st.text_input(
-                "Year folder (e.g. 2026 - created if it doesn't exist)", key="add_file_year"
-            )
-            add_fname = st.text_input("File name (e.g. MyTournament.txt)", key="add_file_name")
-            add_content = st.text_area("File contents", height=200, key="add_file_content")
-            if st.button("Add File", key="add_file_btn"):
-                if not add_year.strip() or not add_fname.strip():
-                    st.error("Enter both a year folder and a file name.")
-                elif not add_fname.strip().lower().endswith(".txt"):
-                    st.error("File name must end in .txt")
-                else:
-                    year_clean = add_year.strip()
-                    fname_clean = add_fname.strip()
-                    target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, year_clean)
-                    target_path = os.path.join(target_dir, fname_clean)
-                    if os.path.exists(target_path):
-                        st.error(f"'{fname_clean}' already exists in '{year_clean}/' - use the "
-                                 f"editor below to modify it instead.")
-                    else:
-                        os.makedirs(target_dir, exist_ok=True)
-                        with open(target_path, "w", encoding="utf-8") as f:
-                            f.write(add_content)
-                        st.success(f"Added '{fname_clean}' to '{year_clean}/'.")
-                        st.rerun()
