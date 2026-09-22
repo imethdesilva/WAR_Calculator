@@ -1124,14 +1124,14 @@ st.markdown("""
        in the same row. A column with no button (used purely as a spacer) is
        left alone, so it keeps growing and absorbs the rest of the row width,
        pushing the compacted button group to whichever side the spacer isn't on. */
-    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stButton"]),
-    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stDownloadButton"]) {
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(div[data-testid="stButton"]),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(div[data-testid="stDownloadButton"]) {
         flex: 0 0 auto !important;
         width: auto !important;
         min-width: 0 !important;
     }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stButton"]) div.stButton > button,
-    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stDownloadButton"]) div[data-testid="stDownloadButton"] > button {
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(div[data-testid="stButton"]) div.stButton > button,
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(div[data-testid="stDownloadButton"]) div[data-testid="stDownloadButton"] > button {
         width: auto !important;
         white-space: nowrap;
         padding-left: 1.1rem;
@@ -1543,11 +1543,10 @@ with tabs[0]:
     archive_ready = ARCHIVE_PASSWORD and st.session_state.archive_unlocked
 
     if archive_ready:
-        header_col, reset_col, refresh_col, lock_col = st.columns(
-            [5, 1, 1, 1], gap="small", vertical_alignment="bottom"
+        st.header("Tournament File Archive")
+        _archive_btns_spacer, reset_col, refresh_col, lock_col = st.columns(
+            [5, 1, 1, 1], gap="small"
         )
-        with header_col:
-            st.header("Tournament File Archive")
         with reset_col:
             if st.button("Reset Dataset", help="Clears the currently computed WAR results and "
                                                 "returns the dashboard to its initial state. "
@@ -1774,10 +1773,11 @@ with tabs[0]:
                                     st.rerun()
 
                             if st.session_state.get(delete_confirm_key):
-                                st.warning(f"This permanently deletes '{fname}' from the archive on "
-                                           f"this machine (it stays on GitHub until you push the "
-                                           f"deletion separately). Re-enter the archive password to "
-                                           f"confirm.")
+                                st.warning(f"This permanently deletes '{fname}' on this machine AND "
+                                           f"pushes that deletion to GitHub (origin/main) - it will "
+                                           f"stop appearing in 'All Tournaments' and be left out of "
+                                           f"any WAR calculation you run afterwards. Re-enter the "
+                                           f"archive password to confirm.")
                                 del_pwd = st.text_input(
                                     "Password", type="password", key=f"archive_delete_pwd_{year}_{fname}"
                                 )
@@ -1790,8 +1790,22 @@ with tabs[0]:
                                         else:
                                             try:
                                                 os.remove(fpath)
-                                                st.session_state[delete_confirm_key] = False
-                                                st.success(f"Deleted '{fname}'.")
+                                                st.session_state.archive_renames.pop((year, fname), None)
+                                                try:
+                                                    delete_archive_file_from_github(
+                                                        os.path.join(TOURNAMENT_ARCHIVE_DIR, year,
+                                                                     original_github_name),
+                                                        f"Delete {original_github_name} ({year}) via "
+                                                        f"WAR Calculator dashboard"
+                                                    )
+                                                    st.session_state[delete_confirm_key] = False
+                                                    st.success(f"Deleted '{fname}' on this machine and "
+                                                               f"on GitHub.")
+                                                except (KeyError, requests.exceptions.RequestException) as e:
+                                                    st.session_state[delete_confirm_key] = False
+                                                    st.warning(f"Deleted '{fname}' on this machine, but "
+                                                               f"the GitHub deletion failed: {e}. Remove "
+                                                               f"it from GitHub manually if needed.")
                                                 st.rerun()
                                             except OSError as e:
                                                 st.error(f"Could not delete {fname}: {e}")
