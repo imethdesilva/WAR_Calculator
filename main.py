@@ -438,6 +438,15 @@ GITHUB_REPO = "imethdesilva/WAR_Calculator"
 GITHUB_BRANCH = "main"
 
 
+def admin_tag():
+    """The name/initials the current admin entered when unlocking the archive, formatted
+    for appending to a commit message - since ARCHIVE_PASSWORD is one shared secret,
+    this is the only thing that ties a given push/delete back to the person who made
+    it, so every commit message built for a password-gated action should include it."""
+    name = st.session_state.get("archive_admin_name", "").strip()
+    return f" [by {name}]" if name else " [by unspecified admin]"
+
+
 def push_archive_file_to_github(fpath, commit_message):
     """Commits fpath's current on-disk content straight to GITHUB_REPO via GitHub's
     Contents API (not the git CLI), so it works identically whether this app is run
@@ -509,12 +518,52 @@ def delete_archive_file_from_github(repo_path, commit_message):
 @st.dialog("Add Tournament File")
 def add_tournament_file_dialog():
     """Modal opened from the 'All Tournaments' tab's '+' button: upload a .txt file,
-    the year folder is auto-detected from the date parsed out of it, and it's saved
-    locally and pushed to GitHub immediately - unlike editing an existing file, a
-    brand-new file carries no risk of overwriting something, so there's no separate
-    review-then-confirm step here."""
+    the year folder is auto-detected from the date parsed out of it, saved locally
+    for review, and only pushed to GitHub once explicitly confirmed - mirroring the
+    Confirm & Push step used when editing an existing archive file, so a bad or
+    fraudulent upload can't reach GitHub without a second, deliberate click."""
+    confirm_key = "add_file_pending_push"
+    pending = st.session_state.get(confirm_key)
+
+    if pending:
+        st.success(f"Detected: **{pending['tournament_name']}** on {pending['date']} - "
+                   f"{pending['player_count']} player(s) parsed"
+                   + (f", {pending['warn_count']} line(s) unparseable" if pending['warn_count'] else "")
+                   + f" - saved locally in '{pending['year']}/'.")
+        if pending["warnings"]:
+            with st.expander(f"{pending['warn_count']} parse warning(s) - review before pushing"):
+                for w in pending["warnings"]:
+                    st.caption(f"- {w}")
+        st.warning("Review the details above, then confirm to push this new file to GitHub "
+                   "(origin/main), or cancel to discard it.")
+        confirm_col, cancel_col, _spacer = st.columns([2, 1, 6])
+        with confirm_col:
+            if st.button("Confirm & Push to GitHub", key="add_file_confirm_push_btn"):
+                try:
+                    push_archive_file_to_github(
+                        pending["path"],
+                        f"Add {pending['fname']} ({pending['year']}) via WAR Calculator dashboard"
+                        f"{admin_tag()}"
+                    )
+                    st.success(f"Added '{pending['fname']}' to '{pending['year']}/' and pushed to GitHub.")
+                except (KeyError, requests.exceptions.RequestException) as e:
+                    st.warning(f"Saved locally, but the GitHub push failed: {e}. Push it from the "
+                               f"'{pending['year']}' tab once resolved.")
+                st.session_state[confirm_key] = None
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", key="add_file_cancel_push_btn"):
+                try:
+                    os.remove(pending["path"])
+                except OSError:
+                    pass
+                st.session_state[confirm_key] = None
+                st.rerun()
+        return
+
     st.caption("Upload a .txt file - the year folder is detected automatically from the date "
-               "in the file, and it's saved locally and pushed straight to GitHub.")
+               "in the file. It's saved locally for review first, and only pushed to GitHub "
+               "once you confirm.")
     uploaded_new_file = st.file_uploader(
         "Upload a tournament .txt file", type=["txt"], key="add_file_uploader_dialog"
     )
@@ -529,8 +578,16 @@ def add_tournament_file_dialog():
         return
 
     detected_year = str(uploaded_data['date'].year)
+    player_count = len({p['name'] for p in uploaded_data['players']})
+    warnings = uploaded_data.get('warnings') or []
     st.success(f"Detected: **{uploaded_data['name'] or 'Unknown tournament'}** on "
-               f"{uploaded_data['date']:%Y-%m-%d} - will be added to '{detected_year}/'.")
+               f"{uploaded_data['date']:%Y-%m-%d} - {player_count} player(s) parsed"
+               + (f", {len(warnings)} line(s) unparseable" if warnings else "")
+               + f" - will be added to '{detected_year}/'.")
+    if warnings:
+        with st.expander(f"{len(warnings)} parse warning(s) - review before adding"):
+            for w in warnings:
+                st.caption(f"- {w}")
 
     target_dir = os.path.join(TOURNAMENT_ARCHIVE_DIR, detected_year)
     target_path = os.path.join(target_dir, uploaded_new_file.name)
@@ -539,18 +596,20 @@ def add_tournament_file_dialog():
                  f"from the archive list to edit it instead.")
         return
 
-    if st.button("Add & Push to GitHub", key="add_file_upload_btn_dialog"):
+    if st.button("Add File", key="add_file_upload_btn_dialog"):
         os.makedirs(target_dir, exist_ok=True)
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(uploaded_content)
-        try:
-            push_archive_file_to_github(
-                target_path,
-                f"Add {uploaded_new_file.name} ({detected_year}) via WAR Calculator dashboard"
-            )
-            st.success(f"Added '{uploaded_new_file.name}' to '{detected_year}/' and pushed to GitHub.")
-        except (KeyError, requests.exceptions.RequestException) as e:
-            st.warning(f"Saved locally, but the GitHub push failed: {e}")
+        st.session_state[confirm_key] = {
+            "path": target_path,
+            "fname": uploaded_new_file.name,
+            "year": detected_year,
+            "tournament_name": uploaded_data['name'] or 'Unknown tournament',
+            "date": uploaded_data['date'].strftime('%Y-%m-%d'),
+            "player_count": player_count,
+            "warn_count": len(warnings),
+            "warnings": warnings,
+        }
         st.rerun()
 
 
@@ -825,6 +884,18 @@ def reset_dataset():
     st.session_state.pop('quad_ranges', None)
 
 
+def sanitize_csv_cell(value):
+    """Neutralizes spreadsheet formula injection: player/tournament names come
+    straight from uploaded tournament files with no character restrictions, so a
+    name starting with =, +, -, @, tab or CR would be evaluated as a live formula
+    by Excel/Sheets when someone opens the exported report. Prefixing with a
+    single quote forces it to be read as literal text instead."""
+    s = str(value)
+    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + s
+    return value
+
+
 def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf = io.StringIO()
     headers_map = threshold_headers(conf)
@@ -838,6 +909,8 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
 
     buf.write("SELECTION LEADERBOARD\n")
     lb_df = pd.DataFrame(rows_sorted)
+    lb_df["Player Name"] = lb_df["Player Name"].map(sanitize_csv_cell)
+    lb_df["Remarks"] = lb_df["Remarks"].map(sanitize_csv_cell)
     lb_df.insert(0, "Rank", range(1, len(lb_df) + 1))
     lb_df = lb_df.rename(columns=headers_map)
     # lineterminator='\n' avoids pandas' default '\r\n' colliding with the plain '\n'
@@ -848,10 +921,11 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
     buf.write("INDIVIDUAL PLAYER BREAKDOWN\n\n")
     for row in rows_sorted:
         name = row["Player Name"]
-        writer.writerow(["Player", name])
+        writer.writerow(["Player", sanitize_csv_cell(name)])
         data = players_db.get(name)
         if data:
             h_df = pd.DataFrame(data["history"])
+            h_df["Tournament"] = h_df["Tournament"].map(sanitize_csv_cell)
             h_df = h_df.sort_values(by="Date", ascending=False)
             h_df.to_csv(buf, index=False, lineterminator='\n')
             war, war_precise = compute_war(data['history'])
@@ -864,7 +938,7 @@ def generate_full_report_csv(rows_sorted, players_db, conf, mode_label):
         if row["Remarks"]:
             # Remarks can contain commas, so this must go through csv.writer (not an
             # f-string) or an unescaped comma would silently shift/break the row.
-            writer.writerow(["Remark", row["Remarks"]])
+            writer.writerow(["Remark", sanitize_csv_cell(row["Remarks"])])
         buf.write("\n\n")
 
     return buf.getvalue()
@@ -1264,6 +1338,7 @@ if 'engine' not in st.session_state:
     st.session_state.uploaded_tournament_dates = []
     st.session_state.upload_warnings = {}
     st.session_state.archive_unlocked = False
+    st.session_state.archive_admin_name = ""
     st.session_state.archive_renames = {}
     st.session_state.results = {}
     st.session_state.active_mode = None
@@ -1429,7 +1504,7 @@ with tabs[2]:
                                             if push_archive_file_to_github(
                                                 fpath,
                                                 f"Merge player name to \"{merge_result['canonical']}\" "
-                                                f"in {fname} ({year})"
+                                                f"in {fname} ({year}){admin_tag()}"
                                             ):
                                                 pushed_count += 1
                                         except (OSError, KeyError, requests.exceptions.RequestException) as e:
@@ -1671,6 +1746,7 @@ with tabs[0]:
         with lock_col:
             if st.button("Lock"):
                 st.session_state.archive_unlocked = False
+                st.session_state.archive_admin_name = ""
                 st.rerun()
     else:
         st.header("Tournament File Archive")
@@ -1680,12 +1756,21 @@ with tabs[0]:
     elif not st.session_state.archive_unlocked:
         st.info("This section is password protected. Enter the password to browse the archived tournament files.")
         archive_pwd = st.text_input("Password", type="password", key="archive_pwd_input")
+        archive_name_input = st.text_input(
+            "Your name / initials", key="archive_name_input",
+            help="The password is shared, so this is recorded on every change you push or delete "
+                 "from this point on - it's what tells one admin's edits apart from another's."
+        )
         if st.button("Unlock Archive"):
-            if archive_pwd == ARCHIVE_PASSWORD:
-                st.session_state.archive_unlocked = True
-                st.rerun()
-            else:
+            if archive_pwd != ARCHIVE_PASSWORD:
                 st.error("Incorrect password.")
+            elif not archive_name_input.strip():
+                st.error("Enter your name or initials - required so changes you make can be traced "
+                          "back to you.")
+            else:
+                st.session_state.archive_unlocked = True
+                st.session_state.archive_admin_name = archive_name_input.strip()
+                st.rerun()
     else:
         if not st.session_state.active_mode:
             st.info("**Getting started:** click **Run WAR for WYSC and WSC** below. Once that "
@@ -1929,7 +2014,7 @@ with tabs[0]:
                                                         os.path.join(TOURNAMENT_ARCHIVE_DIR, year,
                                                                      original_github_name),
                                                         f"Delete {original_github_name} ({year}) via "
-                                                        f"WAR Calculator dashboard"
+                                                        f"WAR Calculator dashboard{admin_tag()}"
                                                     )
                                                     st.session_state[delete_confirm_key] = False
                                                     st.success(f"Deleted '{fname}' on this machine and "
@@ -1985,7 +2070,7 @@ with tabs[0]:
                                                     f"Rename {original_github_name} to {new_fname} "
                                                     f"({year}) via WAR Calculator dashboard" if is_rename else
                                                     f"Edit {fname} ({year}) via WAR Calculator dashboard"
-                                                )
+                                                ) + admin_tag()
                                                 pushed = push_archive_file_to_github(new_fpath, commit_msg)
 
                                                 removed_old = False
@@ -1997,6 +2082,7 @@ with tabs[0]:
                                                         old_repo_path,
                                                         f"Remove {original_github_name} ({year}) - renamed "
                                                         f"to {new_fname} via WAR Calculator dashboard"
+                                                        f"{admin_tag()}"
                                                     )
 
                                                 # GitHub and local now agree under new_fname - drop any
