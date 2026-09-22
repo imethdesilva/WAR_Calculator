@@ -1118,6 +1118,26 @@ st.markdown("""
         gap: 0.5rem;
     }
 
+    /* 2c. Any column that holds a button/download-button shrinks to fit that
+       button instead of stretching to its flex ratio's full share of the row -
+       this is what actually removes the dead space between buttons that sit
+       in the same row. A column with no button (used purely as a spacer) is
+       left alone, so it keeps growing and absorbs the rest of the row width,
+       pushing the compacted button group to whichever side the spacer isn't on. */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stButton"]),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stDownloadButton"]) {
+        flex: 0 0 auto !important;
+        width: auto !important;
+        min-width: 0 !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stButton"]) div.stButton > button,
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has(> div[data-testid="stDownloadButton"]) div[data-testid="stDownloadButton"] > button {
+        width: auto !important;
+        white-space: nowrap;
+        padding-left: 1.1rem;
+        padding-right: 1.1rem;
+    }
+
     /* 3. Global Centering: Applied to standard Tables and modern DataFrames */
     [data-testid="stTable"] th, 
     [data-testid="stTable"] td,
@@ -1861,7 +1881,7 @@ with tabs[0]:
                                         st.rerun()
 
             with year_tabs[-1]:
-                title_col, add_col, _spacer = st.columns([5, 1, 2])
+                title_col, add_col = st.columns([6, 1], vertical_alignment="center")
                 with title_col:
                     st.subheader("All Tournaments (Latest First)")
                 with add_col:
