@@ -4,7 +4,7 @@ A
 
       18 games
        W     M                       Old  Chg  New
-  1   12  +728 Imeth de Silva        1173  +58 1231
+  1   12  +728 Imeth De Silva        1173  +58 1231
   2   12  +145 Udhev Prasath        1253  +32 1285
   3    9   -55 Padumadasa Archana   1115  +18 1133
   4    7  -108 Shaila Amalean       1212  -55 1157
