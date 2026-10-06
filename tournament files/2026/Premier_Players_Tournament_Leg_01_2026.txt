@@ -5,7 +5,7 @@ A
       16 games
        W     M                       Old  Chg  New
   1   10  +309 Sandali Vithanage    1198  +29 1227
-  2  9.5  +502 Imeth de Silva        1196  +20 1216
+  2  9.5  +502 Imeth De Silva        1196  +20 1216
   3    9  +463 Indunil Amarasinghe  1213   +1 1214
   4    9  +330 Shaila Amalean       1205   +3 1208
   5  8.5  +205 Jayaska Baranage     1221   -8 1213
