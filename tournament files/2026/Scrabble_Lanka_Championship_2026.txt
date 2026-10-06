@@ -14,7 +14,7 @@ A
   8   10  +522 Aayush Haputhanthiri  914  +64  978
   9   10  +276 Tenuka Minketh        697  +88  785
  10   10  +120 Kumari Goonesekera    928  +38  966
- 11   10   +32 Imeth de Silva        1216   -5 1211
+ 11   10   +32 Imeth De Silva        1216   -5 1211
  12  9.5  +263 Ravindu Fernando      935  +38  973
  13    9  +962 Devinu Balasooriya    875  +10  885
  14    9  +420 Ilham Irshad         1097  -27 1070
